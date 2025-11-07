@@ -1146,40 +1146,54 @@ async def check_signals(symbol, timeframe='4h'):
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
             else:
                 entry_price = float(df['close'].iloc[-2]) if pd.notna(df['close'].iloc[-2]) else np.nan
-                eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
-                sl_atr_abs = eff_sl_mult * atr_value
-                sl_price = entry_price - sl_atr_abs
-                current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-                if not np.isfinite(entry_price) or not np.isfinite(sl_price):
-                    await mark_status(symbol, "skip", "invalid_entry_sl")
-                    logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
-                    return
-                if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
+                highs_list = df['high'].values.tolist()
+                lows_list = df['low'].values.tolist()
+                closes_list = df['close'].values.tolist()
+                ema_fast_seq = df['ema10'].values.tolist()
+                ema_slow_seq = df['ema30'].values.tolist()  # veya e90, kuralına göre
+                tick_size = MARKETS.get(symbol, {}).get('precision', {}).get('price', DEFAULT_TICK_SIZE)
+                long_signal = try_build_long_signal(
+                    symbol, entry_price, highs_list, lows_list, closes_list,
+                    ema_fast_seq=ema_fast_seq, ema_slow_seq=ema_slow_seq, tick_size=tick_size
+                )
+                if long_signal is None:
                     if VERBOSE_LOG:
-                        logger.info(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
-                    await mark_status(symbol, "skip", "instant_sl_risk")
+                        logger.info(f"{symbol} {timeframe}: BUY atlandı (anında SL riski veya aynı mum exit) 🚫")
+                    await mark_status(symbol, "skip", "instant_sl_risk_or_same_bar_exit")
                 else:
-                    tp1_price = entry_price + (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price + (TP_MULTIPLIER2 * atr_value)
-                    current_pos = {
-                        'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
-                        'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
-                        'lowest_price': None, 'avg_atr_ratio': avg_atr_ratio,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
-                    }
-                    signal_cache[f"{symbol}_{timeframe}"] = current_pos
-                    await enqueue_message("\n".join([
-                        f"{symbol} {timeframe}: BUY (LONG) 🚀",
-                        f"Sebep: {reason}",
-                        f"Entry: {fmt_sym(symbol, entry_price)}",
-                        f"SL: {fmt_sym(symbol, sl_price)}",
-                        f"TP1: {fmt_sym(symbol, tp1_price)}",
-                        f"TP2: {fmt_sym(symbol, tp2_price)}",
-                        f"Tarih: {fmt_date(bar_time)}"
-                    ]))
-                    save_state()
+                    sl_price = long_signal['sl']
+                    tp1_price = long_signal['tp1']
+                    tp2_price = long_signal['tp2']
+                    current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
+                    if not np.isfinite(entry_price) or not np.isfinite(sl_price):
+                        await mark_status(symbol, "skip", "invalid_entry_sl")
+                        logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
+                        return
+                    if current_price <= sl_price + INSTANT_SL_BUFFER * atr_value:
+                        if VERBOSE_LOG:
+                            logger.info(f"{symbol} {timeframe}: BUY atlandı (anında SL riski) 🚫")
+                        await mark_status(symbol, "skip", "instant_sl_risk")
+                    else:
+                        current_pos = {
+                            'signal': 'buy', 'entry_price': entry_price, 'sl_price': sl_price,
+                            'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': entry_price,
+                            'lowest_price': None, 'avg_atr_ratio': avg_atr_ratio,
+                            'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': now,
+                            'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
+                            'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
+                            'entry_bar_index': t  # Exit yasağı için ekledim
+                        }
+                        signal_cache[f"{symbol}_{timeframe}"] = current_pos
+                        await enqueue_message("\n".join([
+                            f"{symbol} {timeframe}: BUY (LONG) 🚀",
+                            f"Sebep: {reason}",
+                            f"Entry: {fmt_sym(symbol, entry_price)}",
+                            f"SL: {fmt_sym(symbol, sl_price)}",
+                            f"TP1: {fmt_sym(symbol, tp1_price)}",
+                            f"TP2: {fmt_sym(symbol, tp2_price)}",
+                            f"Tarih: {fmt_date(bar_time)}"
+                        ]))
+                        save_state()
         elif sell_condition and current_pos['signal'] != 'sell':
             tf_minutes = timeframe_to_minutes(timeframe)
             cooldown_min = max(COOLDOWN_MINUTES, tf_minutes)
@@ -1194,40 +1208,54 @@ async def check_signals(symbol, timeframe='4h'):
                 await mark_status(symbol, "skip", "cooldown_or_same_bar")
             else:
                 entry_price = float(df['close'].iloc[-2]) if pd.notna(df['close'].iloc[-2]) else np.nan
-                eff_sl_mult = SL_MULTIPLIER + SL_BUFFER
-                sl_atr_abs = eff_sl_mult * atr_value
-                sl_price = entry_price + sl_atr_abs
-                current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
-                if not np.isfinite(entry_price) or not np.isfinite(sl_price):
-                    await mark_status(symbol, "skip", "invalid_entry_sl")
-                    logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
-                    return
-                if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
+                highs_list = df['high'].values.tolist()
+                lows_list = df['low'].values.tolist()
+                closes_list = df['close'].values.tolist()
+                ema_fast_seq = df['ema10'].values.tolist()
+                ema_slow_seq = df['ema30'].values.tolist()  # veya e90
+                tick_size = MARKETS.get(symbol, {}).get('precision', {}).get('price', DEFAULT_TICK_SIZE)
+                short_signal = try_build_short_signal(
+                    symbol, entry_price, highs_list, lows_list, closes_list,
+                    ema_fast_seq=ema_fast_seq, ema_slow_seq=ema_slow_seq, tick_size=tick_size
+                )
+                if short_signal is None:
                     if VERBOSE_LOG:
-                        logger.info(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
-                    await mark_status(symbol, "skip", "instant_sl_risk")
+                        logger.info(f"{symbol} {timeframe}: SELL atlandı (anında SL riski veya aynı mum exit) 🚫")
+                    await mark_status(symbol, "skip", "instant_sl_risk_or_same_bar_exit")
                 else:
-                    tp1_price = entry_price - (TP_MULTIPLIER1 * atr_value)
-                    tp2_price = entry_price - (TP_MULTIPLIER2 * atr_value)
-                    current_pos = {
-                        'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
-                        'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
-                        'lowest_price': entry_price, 'avg_atr_ratio': avg_atr_ratio,
-                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': now,
-                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
-                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
-                    }
-                    signal_cache[f"{symbol}_{timeframe}"] = current_pos
-                    await enqueue_message("\n".join([
-                        f"{symbol} {timeframe}: SELL (SHORT) 📉",
-                        f"Sebep: {reason}",
-                        f"Entry: {fmt_sym(symbol, entry_price)}",
-                        f"SL: {fmt_sym(symbol, sl_price)}",
-                        f"TP1: {fmt_sym(symbol, tp1_price)}",
-                        f"TP2: {fmt_sym(symbol, tp2_price)}",
-                        f"Tarih: {fmt_date(bar_time)}"
-                    ]))
-                    save_state()
+                    sl_price = short_signal['sl']
+                    tp1_price = short_signal['tp1']
+                    tp2_price = short_signal['tp2']
+                    current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
+                    if not np.isfinite(entry_price) or not np.isfinite(sl_price):
+                        await mark_status(symbol, "skip", "invalid_entry_sl")
+                        logger.warning(f"Geçersiz giriş/SL fiyatı ({symbol} {timeframe}), skip.")
+                        return
+                    if current_price >= sl_price - INSTANT_SL_BUFFER * atr_value:
+                        if VERBOSE_LOG:
+                            logger.info(f"{symbol} {timeframe}: SELL atlandı (anında SL riski) 🚫")
+                        await mark_status(symbol, "skip", "instant_sl_risk")
+                    else:
+                        current_pos = {
+                            'signal': 'sell', 'entry_price': entry_price, 'sl_price': sl_price,
+                            'tp1_price': tp1_price, 'tp2_price': tp2_price, 'highest_price': None,
+                            'lowest_price': entry_price, 'avg_atr_ratio': avg_atr_ratio,
+                            'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': now,
+                            'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': bar_time,
+                            'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar'),
+                            'entry_bar_index': t  # Exit yasağı için
+                        }
+                        signal_cache[f"{symbol}_{timeframe}"] = current_pos
+                        await enqueue_message("\n".join([
+                            f"{symbol} {timeframe}: SELL (SHORT) 📉",
+                            f"Sebep: {reason}",
+                            f"Entry: {fmt_sym(symbol, entry_price)}",
+                            f"SL: {fmt_sym(symbol, sl_price)}",
+                            f"TP1: {fmt_sym(symbol, tp1_price)}",
+                            f"TP2: {fmt_sym(symbol, tp2_price)}",
+                            f"Tarih: {fmt_date(bar_time)}"
+                        ]))
+                        save_state()
         if current_pos['signal'] == 'buy':
             current_price = float(df['close'].iloc[-1]) if pd.notna(df['close'].iloc[-1]) else np.nan
             if current_pos['highest_price'] is None or current_price > current_pos['highest_price']:
@@ -1261,26 +1289,30 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
                 ]))
                 save_state()
-            if exit_cross_long or regime_break_long:
-                profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                await enqueue_message("\n".join([
-                    f"{symbol} {timeframe}: EMA EXIT (LONG) 🔁",
-                    f"Bar Zamanı: {fmt_date(bar_time)}",
-                    f"Gönderim: {fmt_date(now)}",
-                    f"Price: {fmt_sym(symbol, current_price)}",
-                    f"P/L: {profit_percent:+.2f}%",
-                    f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
-                ]))
-                signal_cache[f"{symbol}_{timeframe}"] = {
-                    'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': None,
-                    'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                    'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
-                }
-                save_state()
-                return
+            # Exit yasağı uygula
+            current_bar_index = t
+            entry_bar_index = current_pos.get('entry_bar_index', -1)
+            if can_evaluate_exit(current_bar_index, entry_bar_index):
+                if exit_cross_long or regime_break_long:
+                    profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                    current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
+                    await enqueue_message("\n".join([
+                        f"{symbol} {timeframe}: EMA EXIT (LONG) 🔁",
+                        f"Bar Zamanı: {fmt_date(bar_time)}",
+                        f"Gönderim: {fmt_date(now)}",
+                        f"Price: {fmt_sym(symbol, current_price)}",
+                        f"P/L: {profit_percent:+.2f}%",
+                        f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
+                    ]))
+                    signal_cache[f"{symbol}_{timeframe}"] = {
+                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
+                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
+                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'buy', 'entry_time': None,
+                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
+                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
+                    }
+                    save_state()
+                    return
             if current_price <= current_pos['sl_price']:
                 profit_percent = ((current_price - current_pos['entry_price']) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
@@ -1335,26 +1367,30 @@ async def check_signals(symbol, timeframe='4h'):
                     f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
                 ]))
                 save_state()
-            if exit_cross_short or regime_break_short:
-                profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
-                current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
-                await enqueue_message("\n".join([
-                    f"{symbol} {timeframe}: EMA EXIT (SHORT) 🔁",
-                    f"Bar Zamanı: {fmt_date(bar_time)}",
-                    f"Gönderim: {fmt_date(now)}",
-                    f"Price: {fmt_sym(symbol, current_price)}",
-                    f"P/L: {profit_percent:+.2f}%",
-                    f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
-                ]))
-                signal_cache[f"{symbol}_{timeframe}"] = {
-                    'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
-                    'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
-                    'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': None,
-                    'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
-                    'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
-                }
-                save_state()
-                return
+            # Exit yasağı uygula
+            current_bar_index = t
+            entry_bar_index = current_pos.get('entry_bar_index', -1)
+            if can_evaluate_exit(current_bar_index, entry_bar_index):
+                if exit_cross_short or regime_break_short:
+                    profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
+                    current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
+                    await enqueue_message("\n".join([
+                        f"{symbol} {timeframe}: EMA EXIT (SHORT) 🔁",
+                        f"Bar Zamanı: {fmt_date(bar_time)}",
+                        f"Gönderim: {fmt_date(now)}",
+                        f"Price: {fmt_sym(symbol, current_price)}",
+                        f"P/L: {profit_percent:+.2f}%",
+                        f"Kalan: %{current_pos['remaining_ratio']*100:.0f}"
+                    ]))
+                    signal_cache[f"{symbol}_{timeframe}"] = {
+                        'signal': None, 'entry_price': None, 'sl_price': None, 'tp1_price': None, 'tp2_price': None,
+                        'highest_price': None, 'lowest_price': None, 'avg_atr_ratio': None,
+                        'remaining_ratio': 1.0, 'last_signal_time': now, 'last_signal_type': 'sell', 'entry_time': None,
+                        'tp1_hit': False, 'tp2_hit': False, 'last_bar_time': None,
+                        'regime_dir': current_pos.get('regime_dir'), 'last_regime_bar': current_pos.get('last_regime_bar')
+                    }
+                    save_state()
+                    return
             if current_price >= current_pos['sl_price']:
                 profit_percent = ((current_pos['entry_price'] - current_price) / current_pos['entry_price']) * 100 if np.isfinite(current_price) and current_pos['entry_price'] else 0
                 current_pos['remaining_ratio'] = float(max(0.0, min(1.0, current_pos['remaining_ratio'])))
@@ -1386,6 +1422,253 @@ async def check_signals(symbol, timeframe='4h'):
         await mark_status(symbol, "error", f"exception:{str(e)[:120]}")
         logger.exception(f"Hata ({symbol} {timeframe}): {e}")
         return
+
+# ===========================
+# PATCH: ATR-TP SYSTEM + EXIT GUARD (LONG/SHORT)
+# ===========================
+# Bu patch, R tabanlı TP/SL hesaplarını TAMAMEN devre dışı bırakır ve
+# ATR tabanlı sabit mesafe seviyeleri ekler.
+# Ayrıca "aynı mumda EMA EXIT" olasılığını önlemek için:
+# - Sinyal üretiminde "hemen çıkış olacaksa" BUY/SELL SİNYALİ ÜRETMEZ.
+# - Girişten sonra en az 1 bar exit yasağı uygular.
+# - Exit kontrollerini kapanmış bar üzerinden yapar.
+
+# ========= K O N F I G =========
+ATR_LOOKBACK = 14
+USE_WILDER_ATR = True          # Wilder ATR
+ATR_SOURCE_TF = None           # None = sinyal TF'inden al; istersen "1h","4h","1d" vb.
+
+SL_ATR_MULT  = 1.8
+TP1_ATR_MULT = 2.0
+TP2_ATR_MULT = 3.5
+
+ROUND_TO_TICK = True
+DEFAULT_TICK_SIZE = None       # sembolden okuyamazsan fallback
+
+# Aşırılıkları engellemek için (opsiyonel) yüzdesel clamp'ler:
+MIN_SL_PCT, MAX_SL_PCT = 0.005, 0.15      # SL mesafesi girişe oranla %0.5–%15 arası
+TP1_MIN_PCT, TP1_MAX_PCT = 0.01, 0.20     # TP1 %1–%20
+TP2_MIN_PCT, TP2_MAX_PCT = 0.02, 0.35     # TP2 %2–%35
+
+# Exit güvenlikleri
+MIN_HOLD_BARS_AFTER_ENTRY = 1   # Girişten sonra en az 1 bar exit YASAK
+USE_CLOSED_CANDLES_FOR_EXIT = True
+EXIT_EVAL_SHIFT = 0             # 0: son kapanmış bar; 1: bir bar daha geriden değerlendir
+
+# ========= A T R  H E S A P =========
+def _true_range(h, l, c_prev):
+    return max(h - l, abs(h - c_prev), abs(l - c_prev))
+
+def _atr_from_series(highs, lows, closes, lookback=ATR_LOOKBACK, use_wilder=True):
+    """
+    ATR'yi kapanmış barlardan hesaplar; son bar kapalı varsayılır.
+    highs/lows/closes: en yeni en sonda OLACAK şekilde dizi
+    """
+    n = len(closes)
+    if n < lookback + 2:
+        return None
+    trs = []
+    for i in range(1, n):
+        trs.append(_true_range(highs[i], lows[i], closes[i-1]))
+    if use_wilder:
+        first = sum(trs[-(lookback+1):-1]) / lookback
+        atr = (first * (lookback - 1) + trs[-1]) / lookback
+        return atr
+    else:
+        return sum(trs[-lookback:]) / lookback
+
+def _round_to_tick(price, tick):
+    if tick is None or tick <= 0:
+        return price
+    return round(price / tick) * tick
+
+
+# ====== E X I T  L O J I K  Ş A B L O N U ======
+# Bu fonksiyonları kendi mevcut exit kurallarına bağla.
+# "EMA EXIT (LONG)" koşulun nasıl tanımlıysa, aşağıdaki iki fonksiyonda ONUNLA değerlendir.
+# Eğer hali hazırda "eval_ema_exit_long/short" gibi fonksiyonların varsa, buradan direkt onları çağır.
+
+def _would_exit_long_on_bar(ref_close, ema_fast=None, ema_slow=None):
+    """
+    EXIT(LONG) koşulunun bar bazlı kontrolü.
+    Basit örnek: close < ema_fast veya ema_fast < ema_slow
+    KENDİ EXIT REGÜLÜNE göre düzenle!
+    """
+    if ema_fast is not None and ref_close < ema_fast:
+        return True
+    # istersen slow ekle:
+    if ema_fast is not None and ema_slow is not None and ema_fast < ema_slow:
+        return True
+    return False
+
+def _would_exit_short_on_bar(ref_close, ema_fast=None, ema_slow=None):
+    """
+    EXIT(SHORT) koşulu (ayna mantık).
+    """
+    if ema_fast is not None and ref_close > ema_fast:
+        return True
+    if ema_fast is not None and ema_slow is not None and ema_fast > ema_slow:
+        return True
+    return False
+
+
+# ====== A T R  T A B A N L I  S E V I Y E ======
+def _clamp_by_pct(dist, entry_price, min_pct, max_pct):
+    if entry_price <= 0:
+        return dist
+    pct = dist / entry_price
+    if min_pct is not None:
+        pct = max(pct, min_pct)
+    if max_pct is not None:
+        pct = min(pct, max_pct)
+    return pct * entry_price
+
+def compute_atr_levels(entry_price, direction, highs, lows, closes, tick_size=None):
+    atr = _atr_from_series(highs, lows, closes, lookback=ATR_LOOKBACK, use_wilder=USE_WILDER_ATR)
+    if atr is None or entry_price <= 0:
+        return None
+
+    sl_dist  = SL_ATR_MULT  * atr
+    tp1_dist = TP1_ATR_MULT * atr
+    tp2_dist = TP2_ATR_MULT * atr
+
+    # SL yüzdesel clamp
+    sl_dist = _clamp_by_pct(sl_dist, entry_price, MIN_SL_PCT, MAX_SL_PCT)
+    # TP clamp
+    tp1_dist = _clamp_by_pct(tp1_dist, entry_price, TP1_MIN_PCT, TP1_MAX_PCT)
+    tp2_dist = _clamp_by_pct(tp2_dist, entry_price, TP2_MIN_PCT, TP2_MAX_PCT)
+
+    if direction == 'long':
+        sl  = entry_price - sl_dist
+        tp1 = entry_price + tp1_dist
+        tp2 = entry_price + tp2_dist
+    else:
+        sl  = entry_price + sl_dist
+        tp1 = entry_price - tp1_dist
+        tp2 = entry_price - tp2_dist
+
+    if ROUND_TO_TICK:
+        t = tick_size if tick_size is not None else DEFAULT_TICK_SIZE
+        sl  = _round_to_tick(sl,  t)
+        tp1 = _round_to_tick(tp1, t)
+        tp2 = _round_to_tick(tp2, t)
+
+    return {"SL": sl, "TP1": tp1, "TP2": tp2, "ATR": atr}
+
+
+# ====== S I N Y A L  Ö N - F I L T R E  (AYNI MUM EXIT ÖNLEME) ======
+def _get_exit_ref_bar_index(total_bars: int) -> int:
+    """
+    Exit değerlendirmesi için referans bar indeksini verir:
+    - USE_CLOSED_CANDLES_FOR_EXIT True ise son kapanmış bar = -2
+    - EXIT_EVAL_SHIFT kadar geriye kaydırabiliriz.
+    """
+    back = 2 + EXIT_EVAL_SHIFT if USE_CLOSED_CANDLES_FOR_EXIT else 1 + EXIT_EVAL_SHIFT
+    return -back  # Python negatif indeks
+
+def _would_exit_now_long(closes, ema_fast_seq=None, ema_slow_seq=None):
+    idx = _get_exit_ref_bar_index(len(closes))
+    ref_close = closes[idx]
+    ef = ema_fast_seq[idx] if ema_fast_seq is not None else None
+    es = ema_slow_seq[idx] if ema_slow_seq is not None else None
+    return _would_exit_long_on_bar(ref_close, ef, es)
+
+def _would_exit_now_short(closes, ema_fast_seq=None, ema_slow_seq=None):
+    idx = _get_exit_ref_bar_index(len(closes))
+    ref_close = closes[idx]
+    ef = ema_fast_seq[idx] if ema_fast_seq is not None else None
+    es = ema_slow_seq[idx] if ema_slow_seq is not None else None
+    return _would_exit_short_on_bar(ref_close, ef, es)
+
+
+# ====== E N T E G R A S Y O N  Ö R N E K L E R I ======
+# *** BUY (LONG) SİNYALİ ÜRETECEĞİN YERDE: ***
+#
+# varsayımlar:
+# - highs,lows,closes: sinyal TF dizileri (en yeni sonda, son bar KAPALI)
+# - ema_fast_seq, ema_slow_seq: exit kuralın için gerekli EMA serileri (opsiyonel)
+# - entry_price: genelde closes[-1] veya işlem platformundaki fill fiyatı
+# - tick_size: borsadan çektiğin asgari fiyat adımı
+# - de-dupe guard/state yönetimi mevcut akışında zaten var (pozisyon yönetiminde MIN_HOLD_BARS_AFTER_ENTRY de uygulanır)
+
+def try_build_long_signal(symbol, entry_price,
+                          highs, lows, closes,
+                          ema_fast_seq=None, ema_slow_seq=None,
+                          tick_size=None):
+    """
+    Long sinyali üretmeden ÖNCE:
+    1) Aynı mumda exit olacak mı kontrol et -> olacaksa sinyal üretme.
+    2) ATR tabanlı SL/TP'leri hesapla.
+    3) Sinyal paketini hazırla.
+    """
+    # 1) Aynı mumda exit olacaksa sinyali atla
+    if _would_exit_now_long(closes, ema_fast_seq, ema_slow_seq):
+        return None  # BUY çıkmasın
+
+    # 2) ATR tabanlı seviyeler
+    levels = compute_atr_levels(entry_price, 'long', highs, lows, closes, tick_size)
+    if levels is None:
+        return None
+
+    signal = {
+        "symbol": symbol,
+        "side": "LONG",
+        "entry": float(entry_price),
+        "sl": float(levels["SL"]),
+        "tp1": float(levels["TP1"]),
+        "tp2": float(levels["TP2"]),
+        "meta": {
+            "atr": float(levels["ATR"]),
+            "sl_atr_mult": SL_ATR_MULT,
+            "tp1_atr_mult": TP1_ATR_MULT,
+            "tp2_atr_mult": TP2_ATR_MULT,
+            "note": "ATR-based targets; pre-filter prevents same-bar EMA EXIT"
+        }
+    }
+    return signal
+
+
+def try_build_short_signal(symbol, entry_price,
+                           highs, lows, closes,
+                           ema_fast_seq=None, ema_slow_seq=None,
+                           tick_size=None):
+    # 1) Aynı mumda exit olacaksa sinyali atla
+    if _would_exit_now_short(closes, ema_fast_seq, ema_slow_seq):
+        return None
+
+    # 2) ATR tabanlı seviyeler
+    levels = compute_atr_levels(entry_price, 'short', highs, lows, closes, tick_size)
+    if levels is None:
+        return None
+
+    signal = {
+        "symbol": symbol,
+        "side": "SHORT",
+        "entry": float(entry_price),
+        "sl": float(levels["SL"]),
+        "tp1": float(levels["TP1"]),
+        "tp2": float(levels["TP2"]),
+        "meta": {
+            "atr": float(levels["ATR"]),
+            "sl_atr_mult": SL_ATR_MULT,
+            "tp1_atr_mult": TP1_ATR_MULT,
+            "tp2_atr_mult": TP2_ATR_MULT,
+            "note": "ATR-based targets; pre-filter prevents same-bar EMA EXIT"
+        }
+    }
+    return signal
+
+
+# *** EXIT DEĞERLENDİRME KATMANINDA (POZİSYON AÇILDI): ***
+# Girişten hemen sonra exit'i engelle:
+def can_evaluate_exit(current_bar_index, entry_bar_index):
+    return (current_bar_index - entry_bar_index) >= MIN_HOLD_BARS_AFTER_ENTRY
+
+# Exit referans barını seç:
+def get_exit_reference_bar(closes):
+    idx = _get_exit_ref_bar_index(len(closes))
+    return closes[idx]
+
 
 # ================== Main ==================
 async def main():
