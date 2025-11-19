@@ -16,7 +16,7 @@ if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
 TIMEFRAME_DAYS = "1d"  # Günlük mum
-BYBIT_LIST_FILE = "binance.txt"  # Senin yüklediğin dosya adı
+BYBIT_LIST_FILE = "binance.txt"  # Senin yüklediğin coin listesi dosyası
 
 
 # =============== Telegram ===============
@@ -94,12 +94,13 @@ def summarize_errors(errors, max_show: int = 10) -> str:
     return f"(Veri hatası: {total} sembol, ilk {max_show}: {shown})"
 
 
-# =============== Hisse Taraması (BIST & Nasdaq) ===============
+# =============== Hisse Taraması (BIST & Nasdaq, toplu yfinance) ===============
 
 def scan_equity_universe(symbols, universe_name: str):
     """
-    yfinance ile günlük veri çekip,
+    yfinance ile TÜM sembolleri toplu indirip,
     EMA 13-34 ve EMA 34-89 için son 1 mum (max 2 mum) bullish cross arar.
+    Toplu indirme = daha az hata / rate limit.
     """
     result = {
         "13_34_bull": [],
@@ -107,29 +108,52 @@ def scan_equity_universe(symbols, universe_name: str):
         "errors": []
     }
 
+    if not symbols:
+        return result
+
+    try:
+        # Bir kerede tüm sembolleri indir
+        data = yf.download(
+            symbols,
+            period="400d",
+            interval=TIMEFRAME_DAYS,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        print(f"{universe_name} toplu indirme hatası:", e)
+        # Hepsini error'a at
+        result["errors"].extend(symbols)
+        return result
+
+    multi = isinstance(data.columns, pd.MultiIndex)
+
     for sym in symbols:
         try:
-            data = yf.download(
-                sym,
-                period="400d",
-                interval=TIMEFRAME_DAYS,
-                auto_adjust=False,
-                progress=False
-            )
-            if data is None or data.empty:
+            if multi:
+                # Çoklu ticker'da her sembol ayrı kolon seviyesinde
+                if sym not in data.columns.levels[0]:
+                    result["errors"].append(sym)
+                    continue
+                df_sym = data[sym].dropna()
+            else:
+                # Tek sembol ise direkt DataFrame
+                df_sym = data
+
+            if "Close" not in df_sym.columns:
                 result["errors"].append(sym)
                 continue
 
-            close = data["Close"].dropna()
+            close = df_sym["Close"].dropna()
             if close.empty:
                 result["errors"].append(sym)
                 continue
 
-            # EMA 13-34 bullish cross (son 1–2 mumda)
             if has_recent_bullish_cross(close, 13, 34):
                 result["13_34_bull"].append(sym)
 
-            # EMA 34-89 bullish cross (son 1–2 mumda)
             if has_recent_bullish_cross(close, 34, 89):
                 result["34_89_bull"].append(sym)
 
@@ -183,7 +207,6 @@ def scan_bybit_spot_from_file(path: str):
         bybit_sym = normalize_to_bybit_symbol(raw)
 
         if bybit_sym not in available_symbols:
-            # Bybit'te bu spot parite yok
             result["errors"].append(f"{raw} (Bybit'te yok)")
             continue
 
@@ -203,7 +226,7 @@ def scan_bybit_spot_from_file(path: str):
                 continue
 
             if has_recent_bullish_cross(close, 13, 34):
-                result["13_34_bull"].append(raw)  # raporda Binance ismiyle göster
+                result["13_34_bull"].append(raw)
 
             if has_recent_bullish_cross(close, 34, 89):
                 result["34_89_bull"].append(raw)
