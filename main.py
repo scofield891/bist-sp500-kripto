@@ -7,13 +7,16 @@ import yfinance as yf
 import pandas as pd
 
 
-# =============== Ortam Değişkenleri (GitHub Secrets'ten gelecek) ===============
+# =============== Ayarlar ===============
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
+
+TIMEFRAME_DAYS = "1d"  # Günlük mum
+BYBIT_LIST_FILE = "binance.txt"  # Senin yüklediğin dosya adı
 
 
 # =============== Telegram ===============
@@ -31,11 +34,9 @@ def send_telegram_message(text: str):
 
 # =============== Ortak Yardımcılar ===============
 
-TIMEFRAME_DAYS = "1d"  # Günlük mum
-
 def read_symbol_file(path: str):
     """
-    bist100.txt / nasdaq100.txt gibi dosyalardan sembol listesi okur.
+    bist100.txt / nasdaq100.txt / binance.txt gibi dosyalardan sembol listesi okur.
     Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
     """
     if not os.path.exists(path):
@@ -52,32 +53,53 @@ def read_symbol_file(path: str):
     return symbols
 
 
-def compute_bullish_cross(close: pd.Series, fast: int, slow: int) -> bool:
+def has_recent_bullish_cross(close: pd.Series, fast: int, slow: int) -> bool:
     """
-    EMA fast & slow için sadece YUKARI kesişime bakar.
-    Dönüş:
-        True  -> bullish (yukarı kesişim var)
-        False -> yok
+    EMA fast & slow için bullish cross noktalarını bulur.
+    Son bullish cross, son mumda veya bir önceki mumdaysa True döner.
+    Aksi halde False.
+
+    Bullish cross: EMA_fast > EMA_slow durumunun False -> True'ya geçtiği bar.
     """
-    if len(close) < slow + 2:
+    if len(close) < slow + 3:
         return False
 
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
 
-    prev_fast, last_fast = ema_fast.iloc[-2], ema_fast.iloc[-1]
-    prev_slow, last_slow = ema_slow.iloc[-2], ema_slow.iloc[-1]
+    fast_above = ema_fast > ema_slow  # boolean seri
 
-    # Aşağıdan yukarı kesti mi?
-    return prev_fast < prev_slow and last_fast > last_slow
+    cross_indices = []
+    for i in range(1, len(fast_above)):
+        if fast_above.iloc[i] and not fast_above.iloc[i - 1]:
+            cross_indices.append(i)
+
+    if not cross_indices:
+        return False
+
+    last_cross = cross_indices[-1]
+    last_idx = len(close) - 1
+
+    # Son mum (last_idx) veya ondan bir önceki mum (last_idx - 1) kabul
+    return last_cross >= last_idx - 1
+
+
+def summarize_errors(errors, max_show: int = 10) -> str:
+    if not errors:
+        return ""
+    total = len(errors)
+    if total <= max_show:
+        return f"(Veri hatası: {', '.join(errors)})"
+    shown = ", ".join(errors[:max_show])
+    return f"(Veri hatası: {total} sembol, ilk {max_show}: {shown})"
 
 
 # =============== Hisse Taraması (BIST & Nasdaq) ===============
 
 def scan_equity_universe(symbols, universe_name: str):
     """
-    yfinance ile günlük veri çekip sadece bullish
-    EMA 13-34 ve EMA 34-89 kesişimlerini bulur.
+    yfinance ile günlük veri çekip,
+    EMA 13-34 ve EMA 34-89 için son 1 mum (max 2 mum) bullish cross arar.
     """
     result = {
         "13_34_bull": [],
@@ -89,7 +111,7 @@ def scan_equity_universe(symbols, universe_name: str):
         try:
             data = yf.download(
                 sym,
-                period="300d",
+                period="400d",
                 interval=TIMEFRAME_DAYS,
                 auto_adjust=False,
                 progress=False
@@ -103,12 +125,12 @@ def scan_equity_universe(symbols, universe_name: str):
                 result["errors"].append(sym)
                 continue
 
-            # EMA 13-34 bullish cross
-            if compute_bullish_cross(close, 13, 34):
+            # EMA 13-34 bullish cross (son 1–2 mumda)
+            if has_recent_bullish_cross(close, 13, 34):
                 result["13_34_bull"].append(sym)
 
-            # EMA 34-89 bullish cross
-            if compute_bullish_cross(close, 34, 89):
+            # EMA 34-89 bullish cross (son 1–2 mumda)
+            if has_recent_bullish_cross(close, 34, 89):
                 result["34_89_bull"].append(sym)
 
         except Exception as e:
@@ -118,48 +140,57 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Binance Spot USDT Taraması ===============
+# =============== Bybit Spot (Binance listesi üzerinden) ===============
 
-def get_binance_spot_usdt_symbols():
+def normalize_to_bybit_symbol(raw: str) -> str:
     """
-    ccxt ile Binance'den tüm spot USDT paritelerini çeker.
-    Futures kullanılmaz, sadece spot.
+    Binance formatındaki sembolü (BTCUSDT, ETHUSDT) Bybit/ccxt formatına çevirir (BTC/USDT).
+    Eğer zaten içinde '/' varsa olduğu gibi bırakır.
     """
-    exchange = ccxt.binance({'enableRateLimit': True})
-    markets = exchange.load_markets()
-    symbols = []
-
-    for m in markets.values():
-        try:
-            if not m.get("spot"):
-                continue
-            if m.get("quote") != "USDT":
-                continue
-            symbols.append(m["symbol"])
-        except Exception:
-            continue
-
-    symbols = sorted(list(set(symbols)))
-    print(f"Binance spot USDT sembol sayısı: {len(symbols)}")
-    return exchange, symbols
+    if "/" in raw:
+        return raw
+    raw = raw.upper()
+    if raw.endswith("USDT") and len(raw) > 4:
+        base = raw[:-4]
+        return f"{base}/USDT"
+    return raw
 
 
-def scan_binance_spot_usdt(exchange, symbols):
+def scan_bybit_spot_from_file(path: str):
     """
-    Binance spot USDT marketler için sadece bullish
-    EMA 13-34 ve EMA 34-89 kesişimleri.
+    binance.txt içindeki coinleri,
+    Bybit spot marketlerinde EMA 13-34 ve EMA 34-89 için son 1–2 mumda bullish cross açısından tarar.
     """
+    symbols_raw = read_symbol_file(path)
+    if not symbols_raw:
+        return {
+            "13_34_bull": [],
+            "34_89_bull": [],
+            "errors": []
+        }
+
+    bybit = ccxt.bybit({'enableRateLimit': True})
+    markets = bybit.load_markets()
+    available_symbols = set(markets.keys())
+
     result = {
         "13_34_bull": [],
         "34_89_bull": [],
         "errors": []
     }
 
-    for sym in symbols:
+    for raw in symbols_raw:
+        bybit_sym = normalize_to_bybit_symbol(raw)
+
+        if bybit_sym not in available_symbols:
+            # Bybit'te bu spot parite yok
+            result["errors"].append(f"{raw} (Bybit'te yok)")
+            continue
+
         try:
-            ohlcv = exchange.fetch_ohlcv(sym, timeframe="1d", limit=150)
+            ohlcv = bybit.fetch_ohlcv(bybit_sym, timeframe="1d", limit=220)
             if not ohlcv or len(ohlcv) < 50:
-                result["errors"].append(sym)
+                result["errors"].append(f"{raw} (veri yok)")
                 continue
 
             df = pd.DataFrame(
@@ -167,16 +198,19 @@ def scan_binance_spot_usdt(exchange, symbols):
                 columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
             close = df["close"].dropna()
+            if close.empty:
+                result["errors"].append(f"{raw} (close boş)")
+                continue
 
-            if compute_bullish_cross(close, 13, 34):
-                result["13_34_bull"].append(sym)
+            if has_recent_bullish_cross(close, 13, 34):
+                result["13_34_bull"].append(raw)  # raporda Binance ismiyle göster
 
-            if compute_bullish_cross(close, 34, 89):
-                result["34_89_bull"].append(sym)
+            if has_recent_bullish_cross(close, 34, 89):
+                result["34_89_bull"].append(raw)
 
         except Exception as e:
-            print("Binance hatası", sym, ":", e)
-            result["errors"].append(sym)
+            print("Bybit hatası", raw, "->", bybit_sym, ":", e)
+            result["errors"].append(f"{raw} (hata: {type(e).__name__})")
 
     return result
 
@@ -189,11 +223,12 @@ def format_result_block(title: str, res: dict) -> str:
     def join_list(lst):
         return ", ".join(lst) if lst else "-"
 
-    lines.append(f"  EMA13-34 YUKARI KESENLER : {join_list(res['13_34_bull'])}")
-    lines.append(f"  EMA34-89 YUKARI KESENLER : {join_list(res['34_89_bull'])}")
+    lines.append(f"EMA13-34 YENİ/YAKIN KESİŞİM : {join_list(res['13_34_bull'])}")
+    lines.append(f"EMA34-89 YENİ/YAKIN KESİŞİM : {join_list(res['34_89_bull'])}")
 
-    if res["errors"]:
-        lines.append(f"  (Veri hatası: {', '.join(res['errors'])})")
+    err_line = summarize_errors(res["errors"])
+    if err_line:
+        lines.append(err_line)
 
     return "\n".join(lines)
 
@@ -206,8 +241,8 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: BIST 100, Nasdaq 100, Binance Spot USDT\n"
-        f"NOT: Sadece bullish (yukarı kesişim) sinyalleri listelenir."
+        f"Evren: BIST 100, Nasdaq 100, Bybit Spot (Binance USDT listesi)\n"
+        f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
 
@@ -225,14 +260,10 @@ def main():
         nasdaq_text = format_result_block("🇺🇸 Nasdaq 100", nasdaq_res)
         send_telegram_message(nasdaq_text)
 
-    # --- Binance Spot USDT --- #
-    try:
-        exchange, binance_symbols = get_binance_spot_usdt_symbols()
-        binance_res = scan_binance_spot_usdt(exchange, binance_symbols)
-        binance_text = format_result_block("🪙 Binance Spot USDT", binance_res)
-        send_telegram_message(binance_text)
-    except Exception as e:
-        send_telegram_message(f"⚠️ Binance spot USDT taramasında hata: {e}")
+    # --- Bybit Spot (Binance listesinden) --- #
+    bybit_res = scan_bybit_spot_from_file(BYBIT_LIST_FILE)
+    bybit_text = format_result_block("🪙 Bybit Spot (Binance USDT listesi)", bybit_res)
+    send_telegram_message(bybit_text)
 
 
 if __name__ == "__main__":
