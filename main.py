@@ -16,7 +16,7 @@ if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
 TIMEFRAME_DAYS = "1d"  # Günlük mum
-BYBIT_LIST_FILE = "binance.txt"  # Senin yüklediğin coin listesi dosyası
+BYBIT_LIST_FILE = "binance.txt"  # Binance USDT listesi dosyası (Bybit spot için kullanılacak)
 
 
 # =============== Telegram ===============
@@ -94,7 +94,7 @@ def summarize_errors(errors, max_show: int = 10) -> str:
     return f"(Veri hatası: {total} sembol, ilk {max_show}: {shown})"
 
 
-# =============== Hisse Taraması (BIST & Nasdaq, toplu yfinance) ===============
+# =============== Hisse Taraması (BIST & S&P 500, toplu yfinance) ===============
 
 def scan_equity_universe(symbols, universe_name: str):
     """
@@ -168,16 +168,37 @@ def scan_equity_universe(symbols, universe_name: str):
 
 def normalize_to_bybit_symbol(raw: str) -> str:
     """
-    Binance formatındaki sembolü (BTCUSDT, ETHUSDT) Bybit/ccxt formatına çevirir (BTC/USDT).
+    Binance formatındaki sembolü (BTCUSDT, BTCUSDT.P, BTCUSDT-PERP vb.)
+    Bybit/ccxt formatına çevirir (BTC/USDT).
     Eğer zaten içinde '/' varsa olduğu gibi bırakır.
     """
-    if "/" in raw:
+    if not raw:
         return raw
-    raw = raw.upper()
-    if raw.endswith("USDT") and len(raw) > 4:
-        base = raw[:-4]
+
+    s = raw.strip().upper()
+
+    # Zaten ccxt formatındaysa dokunma
+    if "/" in s:
+        return s
+
+    # Futures / perpetual eklerini temizle
+    for suf in [".P", "_P", "-PERP", "PERP"]:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+
+    # Klasik USDT çifti
+    if s.endswith("USDT") and len(s) > 4:
+        base = s[:-4]
         return f"{base}/USDT"
-    return raw
+
+    # USD çifti (gerekirse)
+    if s.endswith("USD") and len(s) > 3:
+        base = s[:-3]
+        return f"{base}/USD"
+
+    # Diğerleri için olduğu gibi dön
+    return s
 
 
 def scan_bybit_spot_from_file(path: str):
@@ -195,7 +216,15 @@ def scan_bybit_spot_from_file(path: str):
 
     bybit = ccxt.bybit({'enableRateLimit': True})
     markets = bybit.load_markets()
-    available_symbols = set(markets.keys())
+
+    # Sadece spot market sembolleri
+    available_symbols = {
+        symbol for symbol, m in markets.items()
+        if m.get("spot")
+    }
+
+    print(f"Bybit spot sembol sayısı: {len(available_symbols)}")
+    print(f"binance.txt sembol sayısı: {len(symbols_raw)}")
 
     result = {
         "13_34_bull": [],
@@ -207,7 +236,7 @@ def scan_bybit_spot_from_file(path: str):
         bybit_sym = normalize_to_bybit_symbol(raw)
 
         if bybit_sym not in available_symbols:
-            result["errors"].append(f"{raw} (Bybit'te yok)")
+            result["errors"].append(f"{raw} (Bybit'te yok: {bybit_sym})")
             continue
 
         try:
@@ -264,7 +293,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: BIST 100, Nasdaq 100, Bybit Spot (Binance USDT listesi)\n"
+        f"Evren: BIST 100, S&P 500, Bybit Spot (Binance USDT listesi)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -276,12 +305,12 @@ def main():
         bist_text = format_result_block("🇹🇷 BIST 100", bist_res)
         send_telegram_message(bist_text)
 
-    # --- Nasdaq 100 --- #
-    nasdaq_symbols = read_symbol_file("nasdaq100.txt")
-    if nasdaq_symbols:
-        nasdaq_res = scan_equity_universe(nasdaq_symbols, "Nasdaq 100")
-        nasdaq_text = format_result_block("🇺🇸 Nasdaq 100", nasdaq_res)
-        send_telegram_message(nasdaq_text)
+    # --- S&P 500 (nasdaq100.txt dosyasından okunuyor) --- #
+    sp500_symbols = read_symbol_file("nasdaq100.txt")  # dosya adı şimdilik böyle
+    if sp500_symbols:
+        sp500_res = scan_equity_universe(sp500_symbols, "S&P 500")
+        sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
+        send_telegram_message(sp500_text)
 
     # --- Bybit Spot (Binance listesinden) --- #
     bybit_res = scan_bybit_spot_from_file(BYBIT_LIST_FILE)
