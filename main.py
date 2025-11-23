@@ -275,8 +275,8 @@ def format_result_block(title: str, res: dict) -> str:
     def join_list(lst):
         return ", ".join(lst) if lst else "-"
 
-    lines.append(f"EMA13-34 YENİ/YAKIN KESİŞİM : {join_list(res['13_34_bull'])}")
-    lines.append(f"EMA34-89 YENİ/YAKIN KESİŞİM : {join_list(res['34_89_bull'])}")
+    lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res['13_34_bull'])}")
+    lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res['34_89_bull'])}")
 
     err_line = summarize_errors(res["errors"])
     if err_line:
