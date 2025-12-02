@@ -17,9 +17,9 @@ if not BOT_TOKEN or not CHAT_ID:
 
 TIMEFRAME_DAYS = "1d"  # Günlük mum
 
-# Kripto tarafı ayarları
+# Kripto tarafı ayarları (dinamik, marketcap top N)
 TOP_CRYPTO_MC = 200            # Marketcap'e göre en büyük kaç coin taransın?
-CRYPTO_EXCHANGE = "binance"    # ccxt borsa ismi (binance / bybit vb.)
+CRYPTO_EXCHANGE = "binance"    # ccxt borsa ismi (binance / bybit vs.)
 
 
 # =============== Telegram ===============
@@ -196,16 +196,16 @@ def get_top_crypto_symbols_by_marketcap(limit: int = 200):
     return symbols
 
 
-def map_to_exchange_symbol(sym: str, exchange: ccxt.Exchange):
+def map_to_exchange_symbol(sym: str, exchange):
     """
     CoinGecko sembolünü (BTC, ETH, SOL vs.)
     seçtiğimiz borsanın sembol formatına çevirir.
-    Burada Binance için 'BTCUSDT' gibi map'liyoruz.
+    Burada Binance için 'BTC/USDT' veya 'BTCUSDT' gibi map'liyoruz.
     USDT gibi saçma eşleşmeleri (USDTUSDT) None yapıyoruz.
     """
     s = sym.upper()
 
-    # İstersen stable'ları burada direkt atlayabiliriz
+    # Stablecoin'leri istersen direkt atlayalım (USDTUSDT saçmalamasını engeller)
     if s in ["USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDD", "USDP"]:
         return None
 
@@ -227,6 +227,7 @@ def scan_crypto_top_mcap(limit: int = 200):
     Marketcap'e göre en büyük 'limit' coini bulur (CoinGecko),
     seçili borsadan (CRYPTO_EXCHANGE) günlük OHLCV çekip
     EMA 13-34 ve 34-89 bullish cross taraması yapar.
+    Pencere: son 1–2 mum (has_recent_bullish_cross ile aynı mantık).
     """
     result = {
         "13_34_bull": [],
@@ -295,7 +296,7 @@ def scan_crypto_top_mcap(limit: int = 200):
                 result["errors"].append(f"{ex_sym} (close boş)")
                 continue
 
-            # Kriptoda aynı pencereyi kullanıyoruz (son 1–2 mum)
+            # Kriptoda da 2 mumluk pencere (aynı fonksiyon)
             if has_recent_bullish_cross(close, 13, 34):
                 result["13_34_bull"].append(ex_sym)
 
@@ -361,20 +362,26 @@ def main():
         send_telegram_message(bist_text)
 
     # --- S&P 500 (nasdaq100.txt dosyasından okunuyor) --- #
-    sp500_symbols = read_symbol_file("nasdaq100.txt")  # dosya adı şimdilik böyle
+    sp500_symbols = read_symbol_file("nasdaq100.txt")  # içine SP200 de koymuş olabilirsin, isim önemli değil
     if sp500_symbols:
         sp500_res = scan_equity_universe(sp500_symbols, "S&P 500")
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
     # --- Kripto Top N (marketcap'e göre, dinamik) --- #
-    crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
-    crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, {CRYPTO_EXCHANGE})", crypto_res)
-    send_telegram_message(crypto_text)
+    try:
+        crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
+        crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, {CRYPTO_EXCHANGE})", crypto_res)
+        send_telegram_message(crypto_text)
 
-    dbg = crypto_res.get("debug")
-    if dbg:
-        send_telegram_message("🔍 " + dbg)
+        dbg = crypto_res.get("debug")
+        if dbg:
+            send_telegram_message("🔍 " + dbg)
+    except Exception as e:
+        # Ne olursa olsun kripto tarafı yüzünden script komple patlamasın
+        err_msg = f"🪙 Kripto Top {TOP_CRYPTO_MC} : Çalışma hatası ({type(e).__name__})"
+        send_telegram_message(err_msg)
+        print("Genel kripto hatası:", e)
 
 
 if __name__ == "__main__":
