@@ -16,7 +16,10 @@ if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
 TIMEFRAME_DAYS = "1d"  # Günlük mum
-BYBIT_LIST_FILE = "binance.txt"  # Binance USDT listesi dosyası (Bybit spot için kullanılacak)
+
+# Kripto tarafı ayarları
+TOP_CRYPTO_MC = 200            # Marketcap'e göre en büyük kaç coin taransın?
+CRYPTO_EXCHANGE = "binance"    # ccxt borsa ismi (binance / bybit vb.)
 
 
 # =============== Telegram ===============
@@ -36,7 +39,7 @@ def send_telegram_message(text: str):
 
 def read_symbol_file(path: str):
     """
-    bist100.txt / nasdaq100.txt / binance.txt gibi dosyalardan sembol listesi okur.
+    bist100.txt / nasdaq100.txt gibi dosyalardan sembol listesi okur.
     Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
     """
     if not os.path.exists(path):
@@ -164,86 +167,124 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Bybit Spot (Binance listesi üzerinden) ===============
+# =============== Kripto: Marketcap'e göre TOP 200 (dinamik) ===============
 
-def normalize_to_bybit_symbol(raw: str) -> str:
+def get_top_crypto_symbols_by_marketcap(limit: int = 200):
     """
-    Binance formatındaki sembolü (BTCUSDT, BTCUSDT.P, BTCUSDT-PERP vb.)
-    Bybit/ccxt formatına çevirir (BTC/USDT).
-    Eğer zaten içinde '/' varsa olduğu gibi bırakır.
+    CoinGecko üzerinden, marketcap'e göre en büyük 'limit' coinin sembollerini çeker.
+    Örn: ['BTC', 'ETH', 'USDT', 'BNB', ...]
     """
-    if not raw:
-        return raw
-
-    s = raw.strip().upper()
-
-    # Zaten ccxt formatındaysa dokunma
-    if "/" in s:
-        return s
-
-    # Futures / perpetual eklerini temizle
-    for suf in [".P", "_P", "-PERP", "PERP"]:
-        if s.endswith(suf):
-            s = s[: -len(suf)]
-            break
-
-    # Klasik USDT çifti
-    if s.endswith("USDT") and len(s) > 4:
-        base = s[:-4]
-        return f"{base}/USDT"
-
-    # USD çifti (gerekirse)
-    if s.endswith("USD") and len(s) > 3:
-        base = s[:-3]
-        return f"{base}/USD"
-
-    # Diğerleri için olduğu gibi dön
-    return s
-
-
-def scan_bybit_spot_from_file(path: str):
-    """
-    binance.txt içindeki coinleri,
-    Bybit spot marketlerinde EMA 13-34 ve EMA 34-89 için son 1–2 mumda bullish cross açısından tarar.
-    """
-    symbols_raw = read_symbol_file(path)
-    if not symbols_raw:
-        return {
-            "13_34_bull": [],
-            "34_89_bull": [],
-            "errors": []
-        }
-
-    bybit = ccxt.bybit({'enableRateLimit': True})
-    markets = bybit.load_markets()
-
-    # Sadece spot market sembolleri
-    available_symbols = {
-        symbol for symbol, m in markets.items()
-        if m.get("spot")
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": limit,
+        "page": 1,
+        "sparkline": "false"
     }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
 
-    print(f"Bybit spot sembol sayısı: {len(available_symbols)}")
-    print(f"binance.txt sembol sayısı: {len(symbols_raw)}")
+    symbols = []
+    for coin in data:
+        sym = str(coin.get("symbol", "")).upper().strip()
+        if not sym:
+            continue
+        symbols.append(sym)
 
+    return symbols
+
+
+def map_to_exchange_symbol(sym: str, exchange: ccxt.Exchange):
+    """
+    CoinGecko sembolünü (BTC, ETH, SOL vs.)
+    seçtiğimiz borsanın sembol formatına çevirir.
+    Burada Binance için 'BTCUSDT' gibi map'liyoruz.
+    USDT gibi saçma eşleşmeleri (USDTUSDT) None yapıyoruz.
+    """
+    s = sym.upper()
+
+    # İstersen stable'ları burada direkt atlayabiliriz
+    if s in ["USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDD", "USDP"]:
+        return None
+
+    markets = exchange.markets if hasattr(exchange, "markets") else exchange.load_markets()
+
+    pair1 = s + "/USDT"
+    pair2 = s + "USDT"
+
+    if pair1 in markets:
+        return pair1
+    if pair2 in markets:
+        return pair2
+
+    return None
+
+
+def scan_crypto_top_mcap(limit: int = 200):
+    """
+    Marketcap'e göre en büyük 'limit' coini bulur (CoinGecko),
+    seçili borsadan (CRYPTO_EXCHANGE) günlük OHLCV çekip
+    EMA 13-34 ve 34-89 bullish cross taraması yapar.
+    """
     result = {
         "13_34_bull": [],
         "34_89_bull": [],
-        "errors": []
+        "errors": [],
+        "debug": ""
     }
 
-    for raw in symbols_raw:
-        bybit_sym = normalize_to_bybit_symbol(raw)
+    # 1) CoinGecko'dan marketcap top listesi
+    try:
+        cg_symbols = get_top_crypto_symbols_by_marketcap(limit=limit)
+    except Exception as e:
+        msg = f"CoinGecko top list hatası: {type(e).__name__}"
+        print(msg, e)
+        result["errors"].append(msg)
+        result["debug"] = "CoinGecko'dan marketcap listesi alınamadı."
+        return result
 
-        if bybit_sym not in available_symbols:
-            result["errors"].append(f"{raw} (Bybit'te yok: {bybit_sym})")
-            continue
+    cg_count = len(cg_symbols)
 
+    # 2) Borsaya bağlan (ccxt)
+    try:
+        exchange_class = getattr(ccxt, CRYPTO_EXCHANGE)
+    except AttributeError:
+        err = f"Geçersiz borsa ismi: {CRYPTO_EXCHANGE}"
+        print(err)
+        result["errors"].append(err)
+        result["debug"] = err
+        return result
+
+    exchange = exchange_class({'enableRateLimit': True})
+    markets = exchange.load_markets()
+
+    # 3) CoinGecko sembollerini borsa sembolüne map et
+    mapped_symbols = []
+    not_listed = []
+
+    for sym in cg_symbols:
+        ex_sym = map_to_exchange_symbol(sym, exchange)
+        if ex_sym is None:
+            not_listed.append(sym)
+        else:
+            mapped_symbols.append(ex_sym)
+
+    # uniq yap
+    mapped_symbols = list(dict.fromkeys(mapped_symbols))
+
+    ok_ohlcv = 0
+
+    # 4) EMA taraması
+    for ex_sym in mapped_symbols:
         try:
-            ohlcv = bybit.fetch_ohlcv(bybit_sym, timeframe="1d", limit=220)
+            ohlcv = exchange.fetch_ohlcv(ex_sym, timeframe="1d", limit=220)
             if not ohlcv or len(ohlcv) < 50:
-                result["errors"].append(f"{raw} (veri yok)")
+                result["errors"].append(f"{ex_sym} (veri yok)")
                 continue
+
+            ok_ohlcv += 1
 
             df = pd.DataFrame(
                 ohlcv,
@@ -251,18 +292,32 @@ def scan_bybit_spot_from_file(path: str):
             )
             close = df["close"].dropna()
             if close.empty:
-                result["errors"].append(f"{raw} (close boş)")
+                result["errors"].append(f"{ex_sym} (close boş)")
                 continue
 
+            # Kriptoda aynı pencereyi kullanıyoruz (son 1–2 mum)
             if has_recent_bullish_cross(close, 13, 34):
-                result["13_34_bull"].append(raw)
+                result["13_34_bull"].append(ex_sym)
 
             if has_recent_bullish_cross(close, 34, 89):
-                result["34_89_bull"].append(raw)
+                result["34_89_bull"].append(ex_sym)
 
         except Exception as e:
-            print("Bybit hatası", raw, "->", bybit_sym, ":", e)
-            result["errors"].append(f"{raw} (hata: {type(e).__name__})")
+            print("Kripto hatası", ex_sym, ":", e)
+            result["errors"].append(f"{ex_sym} (hata: {type(e).__name__})")
+
+    err_count = len(result["errors"])
+    c13 = len(result["13_34_bull"])
+    c34 = len(result["34_89_bull"])
+
+    result["debug"] = (
+        f"Kripto debug -> CoinGecko top mcap sayısı: {cg_count}, "
+        f"borsada map edilen: {len(mapped_symbols)}, "
+        f"OHLCV başarı: {ok_ohlcv}, "
+        f"13-34 sinyal: {c13}, 34-89 sinyal: {c34}, "
+        f"hata: {err_count}, "
+        f"borsada listelenmeyen (örnek): {', '.join(not_listed[:10])}"
+    )
 
     return result
 
@@ -278,7 +333,7 @@ def format_result_block(title: str, res: dict) -> str:
     lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res['13_34_bull'])}")
     lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res['34_89_bull'])}")
 
-    err_line = summarize_errors(res["errors"])
+    err_line = summarize_errors(res.get("errors", []))
     if err_line:
         lines.append(err_line)
 
@@ -293,7 +348,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: BIST 100, S&P 500, Bybit Spot (Binance USDT listesi)\n"
+        f"Evren: BIST 100, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} (Marketcap)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -312,10 +367,14 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Bybit Spot (Binance listesinden) --- #
-    bybit_res = scan_bybit_spot_from_file(BYBIT_LIST_FILE)
-    bybit_text = format_result_block("🪙 Bybit Spot (Binance USDT listesi)", bybit_res)
-    send_telegram_message(bybit_text)
+    # --- Kripto Top N (marketcap'e göre, dinamik) --- #
+    crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
+    crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, {CRYPTO_EXCHANGE})", crypto_res)
+    send_telegram_message(crypto_text)
+
+    dbg = crypto_res.get("debug")
+    if dbg:
+        send_telegram_message("🔍 " + dbg)
 
 
 if __name__ == "__main__":
