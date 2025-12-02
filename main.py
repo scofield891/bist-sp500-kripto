@@ -161,7 +161,7 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Marketcap Top 200 (Yfinance Modu) ===============
+# =============== Kripto: Marketcap Top 200 (Yfinance Modu, Stable Temiz) ===============
 
 def get_top_crypto_symbols_by_marketcap(limit: int = 200):
     """
@@ -190,10 +190,40 @@ def get_top_crypto_symbols_by_marketcap(limit: int = 200):
     return symbols
 
 
+def is_probable_stable_symbol(sym: str) -> bool:
+    """
+    Sembol bazlı kaba stable filtre:
+    - Bilinen stable / wrapped listesi
+    - USD, EUR, TRY, GBP, CNY ile biten coin sembollerini de şüpheli sayıp eler.
+    """
+    s = sym.upper()
+
+    ignored_coins = [
+        # Klasik stable'lar
+        "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDD", "USDP",
+        "USDE", "PYUSD", "GHO",
+        "FRAX", "LUSD",
+        # EUR bazlı
+        "EURS", "EURI", "EURT",
+        # Wrapped / staked
+        "WBTC", "WETH", "STETH", "WBETH",
+    ]
+
+    if s in ignored_coins:
+        return True
+
+    # Sondan stable / fiat çağrışımlı takılar
+    if s.endswith(("USD", "EUR", "TRY", "GBP", "CNY")):
+        return True
+
+    return False
+
+
 def scan_crypto_top_mcap(limit: int = 200):
     """
     1) CoinGecko'dan marketcap'e göre ilk 'limit' coini bulur.
-    2) Bunları Yahoo Finance formatına (BTC-USD, ETH-USD) çevirir.
+    2) Stable / wrapped olma ihtimali yüksek olanları sembolden eleyip,
+       kalanları Yahoo Finance formatına (BTC-USD, ETH-USD) çevirir.
     3) Tek seferde toplu indirip EMA kesişimi arar.
 
     AVANTAJ: Rate limit derdi yok, çok hızlı, ccxt yok.
@@ -215,18 +245,17 @@ def scan_crypto_top_mcap(limit: int = 200):
             result["errors"].append(msg)
             return result
 
-        # 2) Sembolleri Yahoo formatına çevir ve filtrele
-        ignored_coins = [
-            "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDD", "USDP",
-            "WBTC", "WETH", "STETH"
-        ]
-
+        # 2) Sembolleri stable filtresinden geçir, Yahoo formatına çevir
         yf_tickers = []
         original_map = {}  # YF sembolü -> Orijinal Coin sembolü
+        skipped_stables = []
 
         for sym in cg_symbols:
             sym_u = sym.upper()
-            if sym_u in ignored_coins:
+
+            # Stable / wrapped / fiat benzeri ise atla
+            if is_probable_stable_symbol(sym_u):
+                skipped_stables.append(sym_u)
                 continue
 
             yf_sym = f"{sym_u}-USD"
@@ -234,10 +263,14 @@ def scan_crypto_top_mcap(limit: int = 200):
             original_map[yf_sym] = sym_u
 
         if not yf_tickers:
-            result["debug"] = "Yahoo için uygun kripto sembolü bulunamadı."
+            result["debug"] = "Yahoo için uygun kripto sembolü bulunamadı (hepsi stable filtresine takıldı)."
             return result
 
-        print(f"Kripto Taraması Başlıyor: {len(yf_tickers)} coin Yahoo Finance üzerinden çekiliyor...")
+        print(
+            f"Kripto taraması: CoinGecko top {limit}, "
+            f"stable filtresinden geçen: {len(yf_tickers)}, "
+            f"stable/fiat diye elenen: {len(skipped_stables)}"
+        )
 
         # 3) Toplu İndirme
         try:
@@ -313,9 +346,11 @@ def scan_crypto_top_mcap(limit: int = 200):
 
         result["debug"] = (
             f"Kaynak: Yahoo Finance (Kripto). "
-            f"Top mcap listesinden {len(yf_tickers)} coin denendi, "
+            f"Top mcap listesinden {len(cg_symbols)} coin çekildi. "
+            f"Stable/fiat filtresinden geçen: {len(yf_tickers)}, "
             f"geçerli veri: {processed_count}. "
-            f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
+            f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet. "
+            f"Stable/fiat diye elenen örnekler: {', '.join(skipped_stables[:10])}"
         )
 
     except Exception as e:
@@ -350,7 +385,8 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: BIST 100, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} (Marketcap, Yahoo Finance)\n"
+        f"Evren: BIST 100, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} "
+        f"(Marketcap, Yahoo Finance)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
