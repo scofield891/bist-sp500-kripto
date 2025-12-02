@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+import time
 import requests
 
 import ccxt
@@ -19,7 +20,7 @@ TIMEFRAME_DAYS = "1d"  # Günlük mum
 
 # Kripto tarafı ayarları (dinamik, marketcap top N)
 TOP_CRYPTO_MC = 200            # Marketcap'e göre en büyük kaç coin taransın?
-CRYPTO_EXCHANGE = "bybit"    # ccxt borsa ismi (binance / bybit vs.)
+CRYPTO_EXCHANGE = "bybit"      # Binance sıkıntılı, Bybit kullanalım
 
 
 # =============== Telegram ===============
@@ -167,7 +168,7 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Marketcap'e göre TOP 200 (dinamik) ===============
+# =============== Kripto: Marketcap'e göre TOP 200 (dinamik, Bybit) ===============
 
 def get_top_crypto_symbols_by_marketcap(limit: int = 200):
     """
@@ -200,19 +201,19 @@ def map_to_exchange_symbol(sym: str, exchange):
     """
     CoinGecko sembolünü (BTC, ETH, SOL vs.)
     seçtiğimiz borsanın sembol formatına çevirir.
-    Burada Binance için 'BTC/USDT' veya 'BTCUSDT' gibi map'liyoruz.
-    USDT gibi saçma eşleşmeleri (USDTUSDT) None yapıyoruz.
+    Bybit için genelde 'BTC/USDT', 'SOL/USDT' gibi.
+    Stablecoin'leri (USDT, USDC vs.) atlıyoruz.
     """
     s = sym.upper()
 
-    # Stablecoin'leri istersen direkt atlayalım (USDTUSDT saçmalamasını engeller)
+    # Stablecoin'leri direkt atla
     if s in ["USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDD", "USDP"]:
         return None
 
     markets = exchange.markets if hasattr(exchange, "markets") else exchange.load_markets()
 
     pair1 = s + "/USDT"
-    pair2 = s + "USDT"
+    pair2 = s + "/USDC"
 
     if pair1 in markets:
         return pair1
@@ -227,7 +228,9 @@ def scan_crypto_top_mcap(limit: int = 200):
     Marketcap'e göre en büyük 'limit' coini bulur (CoinGecko),
     seçili borsadan (CRYPTO_EXCHANGE) günlük OHLCV çekip
     EMA 13-34 ve 34-89 bullish cross taraması yapar.
+
     Pencere: son 1–2 mum (has_recent_bullish_cross ile aynı mantık).
+    RateLimitExceeded yaşamamak için her istekte küçük sleep koyuyoruz.
     """
     result = {
         "13_34_bull": [],
@@ -236,89 +239,112 @@ def scan_crypto_top_mcap(limit: int = 200):
         "debug": ""
     }
 
-    # 1) CoinGecko'dan marketcap top listesi
     try:
-        cg_symbols = get_top_crypto_symbols_by_marketcap(limit=limit)
+        # 1) CoinGecko'dan marketcap top listesi
+        try:
+            cg_symbols = get_top_crypto_symbols_by_marketcap(limit=limit)
+        except Exception as e:
+            msg = f"CoinGecko top list hatası: {type(e).__name__}"
+            print(msg, e)
+            result["errors"].append(msg)
+            result["debug"] = "CoinGecko'dan marketcap listesi alınamadı."
+            return result
+
+        cg_count = len(cg_symbols)
+
+        # 2) Borsaya bağlan (ccxt)
+        try:
+            exchange_class = getattr(ccxt, CRYPTO_EXCHANGE)
+        except AttributeError:
+            err = f"Geçersiz borsa ismi: {CRYPTO_EXCHANGE}"
+            print(err)
+            result["errors"].append(err)
+            result["debug"] = err
+            return result
+
+        exchange = exchange_class({'enableRateLimit': True})
+        markets = exchange.load_markets()
+
+        # 3) CoinGecko sembollerini borsa sembolüne map et
+        mapped_symbols = []
+        not_listed = []
+
+        for sym in cg_symbols:
+            ex_sym = map_to_exchange_symbol(sym, exchange)
+            if ex_sym is None:
+                not_listed.append(sym)
+            else:
+                mapped_symbols.append(ex_sym)
+
+        # uniq yap
+        mapped_symbols = list(dict.fromkeys(mapped_symbols))
+
+        ok_ohlcv = 0
+
+        # 4) EMA taraması
+        # Bybit rate limit'e takılmamak için her istekte biraz bekle
+        # exchange.rateLimit milisaniye cinsinden -> saniyeye çevir
+        base_sleep = 0.3
+        try:
+            if getattr(exchange, "rateLimit", None):
+                base_sleep = max(base_sleep, exchange.rateLimit / 1000.0 * 1.2)
+        except Exception:
+            pass
+
+        for ex_sym in mapped_symbols:
+            try:
+                time.sleep(base_sleep)
+
+                ohlcv = exchange.fetch_ohlcv(ex_sym, timeframe="1d", limit=220)
+                if not ohlcv or len(ohlcv) < 50:
+                    result["errors"].append(f"{ex_sym} (veri yok)")
+                    continue
+
+                ok_ohlcv += 1
+
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                close = df["close"].dropna()
+                if close.empty:
+                    result["errors"].append(f"{ex_sym} (close boş)")
+                    continue
+
+                # Kriptoda da 2 mumluk pencere (aynı fonksiyon)
+                if has_recent_bullish_cross(close, 13, 34):
+                    result["13_34_bull"].append(ex_sym)
+
+                if has_recent_bullish_cross(close, 34, 89):
+                    result["34_89_bull"].append(ex_sym)
+
+            except Exception as e:
+                # RateLimitExceeded dahil tüm hataları burada yakala
+                print("Kripto hatası", ex_sym, ":", e)
+                result["errors"].append(f"{ex_sym} (hata: {type(e).__name__})")
+                # Rate limit durumunda döngüye devam edelim, sistem komple patlamasın
+                continue
+
+        err_count = len(result["errors"])
+        c13 = len(result["13_34_bull"])
+        c34 = len(result["34_89_bull"])
+
+        result["debug"] = (
+            f"Kripto debug -> CoinGecko top mcap sayısı: {cg_count}, "
+            f"borsada map edilen: {len(mapped_symbols)}, "
+            f"OHLCV başarı: {ok_ohlcv}, "
+            f"13-34 sinyal: {c13}, 34-89 sinyal: {c34}, "
+            f"hata: {err_count}, "
+            f"borsada listelenmeyen (örnek): {', '.join(not_listed[:10])}"
+        )
+
     except Exception as e:
-        msg = f"CoinGecko top list hatası: {type(e).__name__}"
+        # En üst seviye güvenlik ağı: hiçbir şey dışarı taşmasın
+        msg = f"genel kripto hatası: {type(e).__name__}"
         print(msg, e)
         result["errors"].append(msg)
-        result["debug"] = "CoinGecko'dan marketcap listesi alınamadı."
-        return result
-
-    cg_count = len(cg_symbols)
-
-    # 2) Borsaya bağlan (ccxt)
-    try:
-        exchange_class = getattr(ccxt, CRYPTO_EXCHANGE)
-    except AttributeError:
-        err = f"Geçersiz borsa ismi: {CRYPTO_EXCHANGE}"
-        print(err)
-        result["errors"].append(err)
-        result["debug"] = err
-        return result
-
-    exchange = exchange_class({'enableRateLimit': True})
-    markets = exchange.load_markets()
-
-    # 3) CoinGecko sembollerini borsa sembolüne map et
-    mapped_symbols = []
-    not_listed = []
-
-    for sym in cg_symbols:
-        ex_sym = map_to_exchange_symbol(sym, exchange)
-        if ex_sym is None:
-            not_listed.append(sym)
-        else:
-            mapped_symbols.append(ex_sym)
-
-    # uniq yap
-    mapped_symbols = list(dict.fromkeys(mapped_symbols))
-
-    ok_ohlcv = 0
-
-    # 4) EMA taraması
-    for ex_sym in mapped_symbols:
-        try:
-            ohlcv = exchange.fetch_ohlcv(ex_sym, timeframe="1d", limit=220)
-            if not ohlcv or len(ohlcv) < 50:
-                result["errors"].append(f"{ex_sym} (veri yok)")
-                continue
-
-            ok_ohlcv += 1
-
-            df = pd.DataFrame(
-                ohlcv,
-                columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
-            close = df["close"].dropna()
-            if close.empty:
-                result["errors"].append(f"{ex_sym} (close boş)")
-                continue
-
-            # Kriptoda da 2 mumluk pencere (aynı fonksiyon)
-            if has_recent_bullish_cross(close, 13, 34):
-                result["13_34_bull"].append(ex_sym)
-
-            if has_recent_bullish_cross(close, 34, 89):
-                result["34_89_bull"].append(ex_sym)
-
-        except Exception as e:
-            print("Kripto hatası", ex_sym, ":", e)
-            result["errors"].append(f"{ex_sym} (hata: {type(e).__name__})")
-
-    err_count = len(result["errors"])
-    c13 = len(result["13_34_bull"])
-    c34 = len(result["34_89_bull"])
-
-    result["debug"] = (
-        f"Kripto debug -> CoinGecko top mcap sayısı: {cg_count}, "
-        f"borsada map edilen: {len(mapped_symbols)}, "
-        f"OHLCV başarı: {ok_ohlcv}, "
-        f"13-34 sinyal: {c13}, 34-89 sinyal: {c34}, "
-        f"hata: {err_count}, "
-        f"borsada listelenmeyen (örnek): {', '.join(not_listed[:10])}"
-    )
+        if not result["debug"]:
+            result["debug"] = msg
 
     return result
 
@@ -368,20 +394,14 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Kripto Top N (marketcap'e göre, dinamik) --- #
-    try:
-        crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
-        crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, {CRYPTO_EXCHANGE})", crypto_res)
-        send_telegram_message(crypto_text)
+    # --- Kripto Top N (marketcap'e göre, dinamik, Bybit) --- #
+    crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
+    crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, {CRYPTO_EXCHANGE})", crypto_res)
+    send_telegram_message(crypto_text)
 
-        dbg = crypto_res.get("debug")
-        if dbg:
-            send_telegram_message("🔍 " + dbg)
-    except Exception as e:
-        # Ne olursa olsun kripto tarafı yüzünden script komple patlamasın
-        err_msg = f"🪙 Kripto Top {TOP_CRYPTO_MC} : Çalışma hatası ({type(e).__name__})"
-        send_telegram_message(err_msg)
-        print("Genel kripto hatası:", e)
+    dbg = crypto_res.get("debug")
+    if dbg:
+        send_telegram_message("🔍 " + dbg)
 
 
 if __name__ == "__main__":
