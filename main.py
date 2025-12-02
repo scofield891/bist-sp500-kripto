@@ -19,7 +19,7 @@ TIMEFRAME_DAYS = "1d"  # Günlük mum
 
 # Kripto tarafı ayarları (dinamik, marketcap top N)
 TOP_CRYPTO_MC = 200            # Marketcap'e göre en büyük kaç coin taransın?
-CRYPTO_EXCHANGE = "binance"    # ccxt borsa ismi (binance / bybit vs.)
+CRYPTO_EXCHANGE = "bybit"    # ccxt borsa ismi (binance / bybit vs.)
 
 
 # =============== Telegram ===============
