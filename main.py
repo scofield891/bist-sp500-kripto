@@ -18,7 +18,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
-TIMEFRAME_DAYS = "1d"  # Günlük mum (yfinance & Bybit 1D)
+TIMEFRAME_DAYS = "1d"  # Günlük mum (yfinance tarafı)
 
 # ---- BIST evreni (havuz + likiditeye göre TOP N) ----
 # İçine 500+ BIST hissesini yazacağımız havuz dosyası
@@ -31,7 +31,7 @@ BIST_MAX_COUNT = int(os.getenv("BIST_MAX_COUNT", "150"))
 # Örn: "BIST Top 150 Likit"
 BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
-# Kripto tarafı: Binance sembol listesi dosyası (BTCUSDT, ETHUSDT, ...)
+# Kripto tarafı: Binance sembol listesi dosyası (BTC/USDT, ETH/USDT, ...)
 BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
 
 # =============== Telegram ===============
@@ -301,6 +301,7 @@ def scan_equity_universe(symbols, universe_name: str):
                 result["errors"].append(sym)
                 continue
 
+            # Hisse tarafı için min_rel_gap kullanmıyoruz (0 bırakıyoruz)
             if has_recent_bullish_cross(close, 13, 34):
                 result["13_34_bull"].append(sym)
 
@@ -314,46 +315,16 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Binance listesi, Bybit datası ===============
+# =============== Kripto: Binance listesi, Binance SPOT 1D ===============
 
-def map_binance_to_bybit_symbol(binance_symbol: str, markets: dict) -> str | None:
+CRYPTO_TIMEFRAME = "1d"
+CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
+
+
+def scan_crypto_from_binance_list() -> dict:
     """
-    Binance sembolü (BTCUSDT, ETHUSDT, ARBUSDT ...) alır,
-    Bybit'teki muhtemel market adlarına map etmeye çalışır.
-
-    Öncelik:
-      1) BTC/USDT:USDT (perpetual)
-      2) BTC/USDT     (spot)
-    """
-    s = binance_symbol.strip().upper()
-    if not s:
-        return None
-
-    if s.endswith("USDT"):
-        base = s[:-4]
-    else:
-        base = s
-
-    candidates = [
-        f"{base}/USDT:USDT",  # USDT perpetual
-        f"{base}/USDT",       # spot
-    ]
-
-    for c in candidates:
-        if c in markets:
-            return c
-
-    return None
-
-
-def scan_crypto_bybit_from_file(
-    symbol_file: str = BINANCE_LIST_FILE,
-    timeframe: str = "1d",
-    limit: int = 400
-):
-    """
-    Binance sembol listesi dosyasını (BTCUSDT, ETHUSDT, ...) okuyup,
-    Bybit 1D mumları ile EMA13-34 / EMA34-89 bullish cross arar.
+    binance.txt içindeki sembolleri (BTC/USDT, ARB/USDT ...) alır,
+    Binance SPOT'tan 1D OHLCV çeker ve EMA 13-34 / 34-89 bullish cross tarar.
     """
     result = {
         "13_34_bull": [],
@@ -362,73 +333,74 @@ def scan_crypto_bybit_from_file(
         "debug": ""
     }
 
-    symbols = read_symbol_file(symbol_file)
+    symbols = read_symbol_file(BINANCE_LIST_FILE)
     if not symbols:
-        result["debug"] = f"{symbol_file} boş veya bulunamadı."
+        result["debug"] = f"{BINANCE_LIST_FILE} boş veya bulunamadı."
         return result
 
+    # Binance borsasını başlat
     try:
-        exchange = ccxt.bybit({"enableRateLimit": True})
-        exchange.load_markets()
-        markets = exchange.markets
+        exchange = ccxt.binance({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        })
     except Exception as e:
-        msg = f"Bybit borsası başlatılamadı: {e}"
+        msg = f"Binance borsası başlatılamadı: {e}"
         print(msg)
         result["errors"].append(msg)
         return result
 
     processed_count = 0
 
-    for bin_sym in symbols:
-        bin_sym_u = bin_sym.strip().upper()
-        if not bin_sym_u:
-            continue
-
-        market_symbol = map_binance_to_bybit_symbol(bin_sym_u, markets)
-        if market_symbol is None:
-            print("Bybit market bulunamadı:", bin_sym_u)
-            result["errors"].append(bin_sym_u)
+    for sym in symbols:
+        sym = sym.strip()
+        if not sym:
             continue
 
         try:
+            # Örn: 'BTC/USDT'
             ohlcv = exchange.fetch_ohlcv(
-                market_symbol,
-                timeframe=timeframe,
-                limit=limit,
+                sym,
+                timeframe=CRYPTO_TIMEFRAME,
+                limit=CRYPTO_OHLC_LIMIT,
             )
         except Exception as e:
-            print("Bybit veri hatası:", bin_sym_u, market_symbol, "->", e)
-            result["errors"].append(bin_sym_u)
+            # Sembol Binance'te yoksa / geçici hata varsa buraya düşer
+            msg = f"{sym}: {e}"
+            print("Kripto veri hatası:", msg)
+            result["errors"].append(msg)
             continue
 
-        if not ohlcv or len(ohlcv) < 50:
-            result["errors"].append(bin_sym_u)
+        if not ohlcv or len(ohlcv) < 60:
+            msg = f"{sym}: yetersiz OHLCV verisi"
+            print(msg)
+            result["errors"].append(msg)
             continue
 
-        closes = pd.Series(
-            [c[4] for c in ohlcv],
-            index=pd.to_datetime([c[0] for c in ohlcv], unit="ms", utc=True),
+        # ccxt -> DataFrame
+        df = pd.DataFrame(
+            ohlcv,
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
+        close = df["close"].astype(float)
 
-        try:
-            if has_recent_bullish_cross(closes, 13, 34):
-                result["13_34_bull"].append(bin_sym_u)
+        # Sinyal tarafında sadece coin adını gösterelim (BTC, ARB gibi)
+        display_name = sym.replace("/USDT", "")
 
-            if has_recent_bullish_cross(closes, 34, 89):
-                result["34_89_bull"].append(bin_sym_u)
+        # Kriptoda çok minik kesişimleri elemek için hafif gap filtresi kullanabiliriz (ör: %0.05)
+        if has_recent_bullish_cross(close, 13, 34, min_rel_gap=0.0005):
+            result["13_34_bull"].append(display_name)
 
-            processed_count += 1
+        if has_recent_bullish_cross(close, 34, 89, min_rel_gap=0.0005):
+            result["34_89_bull"].append(display_name)
 
-        except Exception as e:
-            print("Kripto hesap hatası:", bin_sym_u, "->", e)
-            result["errors"].append(bin_sym_u)
-            continue
+        processed_count += 1
 
     c13 = len(result["13_34_bull"])
     c34 = len(result["34_89_bull"])
 
     result["debug"] = (
-        f"Kaynak: Bybit 1D. Binance listesinden {len(symbols)} sembol okundu, "
+        f"Kaynak: Binance SPOT 1D. Binance listesinden {len(symbols)} sembol okundu, "
         f"geçerli veri: {processed_count}. "
         f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
     )
@@ -462,7 +434,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (Bybit)\n"
+        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (Binance 1D)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -494,9 +466,9 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Kripto (Binance listesi, Bybit datası) --- #
-    crypto_res = scan_crypto_bybit_from_file(symbol_file=BINANCE_LIST_FILE, timeframe="1d", limit=400)
-    crypto_text = format_result_block("🪙 Kripto (Binance listesi, Bybit 1D)", crypto_res)
+    # --- Kripto (Binance listesi, Binance SPOT 1D) --- #
+    crypto_res = scan_crypto_from_binance_list()
+    crypto_text = format_result_block("🪙 Kripto (Binance listesi, Binance 1D)", crypto_res)
     send_telegram_message(crypto_text)
 
     dbg = crypto_res.get("debug")
