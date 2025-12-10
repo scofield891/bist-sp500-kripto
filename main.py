@@ -315,16 +315,16 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Binance listesi, BingX SPOT+SWAP 1D ===============
+# =============== Kripto: Binance listesi, MEXC 1D ===============
 
 CRYPTO_TIMEFRAME = "1d"
 CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
 
 
-def find_bingx_symbol(binance_symbol: str, markets: dict) -> str | None:
+def find_mexc_symbol(binance_symbol: str, markets: dict) -> str | None:
     """
     Binance tarzı sembolü (BTC/USDT veya BTCUSDT) alır,
-    BingX'te olası market adını tahmin eder.
+    MEXC'te olası market adını tahmin eder.
 
     Denenen formatlar:
       - BTC/USDT
@@ -356,10 +356,10 @@ def find_bingx_symbol(binance_symbol: str, markets: dict) -> str | None:
     return None
 
 
-def scan_crypto_from_bingx_list() -> dict:
+def scan_crypto_from_mexc_list() -> dict:
     """
     binance.txt içindeki sembolleri (BTC/USDT, ARB/USDT ...) alır,
-    BingX 1D OHLCV'den EMA 13-34 / 34-89 bullish cross tarar.
+    MEXC 1D OHLCV'den EMA 13-34 / 34-89 bullish cross tarar.
     """
     result = {
         "13_34_bull": [],
@@ -373,14 +373,14 @@ def scan_crypto_from_bingx_list() -> dict:
         result["debug"] = f"{BINANCE_LIST_FILE} boş veya bulunamadı."
         return result
 
-    # BingX borsasını başlat
+    # MEXC borsasını başlat
     try:
-        exchange = ccxt.bingx({
+        exchange = ccxt.mexc({
             "enableRateLimit": True,
         })
         markets = exchange.load_markets()
     except Exception as e:
-        msg = f"BingX borsası başlatılamadı: {e}"
+        msg = f"MEXC borsası başlatılamadı: {e}"
         print(msg)
         result["errors"].append(msg)
         return result
@@ -393,9 +393,9 @@ def scan_crypto_from_bingx_list() -> dict:
         if not raw_sym:
             continue
 
-        bingx_symbol = find_bingx_symbol(raw_sym, markets)
-        if bingx_symbol is None:
-            msg = f"{raw_sym}: BingX'te uygun market bulunamadı"
+        mexc_symbol = find_mexc_symbol(raw_sym, markets)
+        if mexc_symbol is None:
+            msg = f"{raw_sym}: MEXC'te uygun market bulunamadı"
             print(msg)
             result["errors"].append(msg)
             continue
@@ -404,18 +404,18 @@ def scan_crypto_from_bingx_list() -> dict:
 
         try:
             ohlcv = exchange.fetch_ohlcv(
-                bingx_symbol,
+                mexc_symbol,
                 timeframe=CRYPTO_TIMEFRAME,
                 limit=CRYPTO_OHLC_LIMIT,
             )
         except Exception as e:
-            msg = f"{raw_sym} ({bingx_symbol}): {e}"
+            msg = f"{raw_sym} ({mexc_symbol}): {e}"
             print("Kripto veri hatası:", msg)
             result["errors"].append(msg)
             continue
 
         if not ohlcv or len(ohlcv) < 60:
-            msg = f"{raw_sym} ({bingx_symbol}): yetersiz OHLCV verisi"
+            msg = f"{raw_sym} ({mexc_symbol}): yetersiz OHLCV verisi"
             print(msg)
             result["errors"].append(msg)
             continue
@@ -443,8 +443,8 @@ def scan_crypto_from_bingx_list() -> dict:
     c34 = len(result["34_89_bull"])
 
     result["debug"] = (
-        f"Kaynak: BingX 1D. Binance listesinden {len(symbols)} satır okundu, "
-        f"BingX'te market bulunan: {have_market_count}, "
+        f"Kaynak: MEXC 1D. Binance listesinden {len(symbols)} satır okundu, "
+        f"MEXC'te market bulunan: {have_market_count}, "
         f"geçerli veri çekilen: {processed_count}. "
         f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
     )
@@ -478,7 +478,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (BingX 1D)\n"
+        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (MEXC 1D)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -510,9 +510,9 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Kripto (Binance listesi, BingX 1D) --- #
-    crypto_res = scan_crypto_from_bingx_list()
-    crypto_text = format_result_block("🪙 Kripto (Binance listesi, BingX 1D)", crypto_res)
+    # --- Kripto (Binance listesi, MEXC 1D) --- #
+    crypto_res = scan_crypto_from_mexc_list()
+    crypto_text = format_result_block("🪙 Kripto (Binance listesi, MEXC 1D)", crypto_res)
     send_telegram_message(crypto_text)
 
     dbg = crypto_res.get("debug")
