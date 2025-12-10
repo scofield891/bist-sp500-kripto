@@ -34,8 +34,9 @@ BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 # Kripto tarafı: Binance sembol listesi dosyası (BTC/USDT, ETH/USDT, ...)
 BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
 
-CRYPTO_TIMEFRAME = "1d"      # ccxt için
-CRYPTO_OHLC_LIMIT = 220      # EMA için yeterli mum sayısı
+# BingX ayarları
+CRYPTO_TIMEFRAME = "1d"
+CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
 
 
 # =============== Telegram ===============
@@ -57,18 +58,22 @@ def read_symbol_file(path: str):
     """
     bist_all.txt / nasdaq100.txt / binance.txt gibi dosyalardan sembol listesi okur.
     Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
+    Aynı sembol birden çok kez geçiyorsa, ilk görüleni korunur (sırayı bozmadan uniq).
     """
     if not os.path.exists(path):
         print(f"UYARI: {path} bulunamadı, bu evren taranmayacak.")
         return []
 
     symbols = []
+    seen = set()
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            symbols.append(line)
+            if line not in seen:
+                symbols.append(line)
+                seen.add(line)
     return symbols
 
 
@@ -165,9 +170,9 @@ def has_recent_bullish_cross(
     close: pd.Series,
     fast: int,
     slow: int,
-    max_bars_ago: int = 1,    # en fazla kaç bar önce? 1 = son bar veya bir önceki bar
-    max_days_ago: int = 2,    # en fazla kaç takvim günü önce?
-    min_rel_gap: float = 0.0  # cross anında min fark (gap/price), 0 ise kontrol yok
+    max_bars_ago: int = 1,   # en fazla kaç bar önce? 0 = sadece son bar
+    max_days_ago: int = 2,   # en fazla kaç takvim günü önce?
+    min_rel_gap: float = 0.0 # cross anında min fark (gap/price), 0 ise kontrol yok
 ) -> bool:
     """
     EMA fast & slow için bullish cross noktalarını bulur.
@@ -188,6 +193,7 @@ def has_recent_bullish_cross(
 
     cross_indices = []
     for i in range(1, len(fast_above)):
+        # Önceki bar fast <= slow, bu bardan itibaren fast > slow ise bullish cross
         if fast_above.iloc[i] and not fast_above.iloc[i - 1]:
             cross_indices.append(i)
 
@@ -197,7 +203,7 @@ def has_recent_bullish_cross(
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
 
-    # 1) Bar bazlı kontrol: son bar veya bir önceki bar içinde mi?
+    # 1) Bar bazlı kontrol
     if last_cross < last_idx - max_bars_ago:
         return False
 
@@ -214,7 +220,7 @@ def has_recent_bullish_cross(
             print("Gap kontrolü hatası (has_recent_bullish_cross):", e)
             return False
 
-    # 2) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
+    # 2) Tarih bazlı kontrol
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         try:
@@ -319,7 +325,7 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Binance listesi, BingX 1D (ccxt) ===============
+# =============== Kripto: Binance listesi, BingX SPOT/PERP 1D ===============
 
 def map_binance_to_bingx_symbol(binance_symbol: str, markets: dict) -> str | None:
     """
@@ -334,19 +340,27 @@ def map_binance_to_bingx_symbol(binance_symbol: str, markets: dict) -> str | Non
     if not s:
         return None
 
-    # Binance formatı: BTC/USDT
+    # Binance formatı: BTC/USDT veya BTCUSDT
     if "/" in s:
         base, quote = s.split("/")
     else:
-        # BTCUSDT gibi gelirse
         if s.endswith("USDT"):
             base = s[:-4]
             quote = "USDT"
         else:
             return None
 
+    # Binance -> BingX isim fixleri
+    rename_map = {
+        "MATIC": "POL",      # Eski isim MATIC, yeni POL
+        "RNDR": "RENDER",
+        "FRONT": "SLF",
+        "PLA": "PDA",
+    }
+    base = rename_map.get(base, base)
+
     candidates = [
-        f"{base}/{quote}:USDT",  # perpetual çoğu coin böyle
+        f"{base}/{quote}:USDT",  # perpetual
         f"{base}/{quote}",       # spot
     ]
 
@@ -360,7 +374,7 @@ def map_binance_to_bingx_symbol(binance_symbol: str, markets: dict) -> str | Non
 def scan_crypto_from_bingx_list() -> dict:
     """
     binance.txt içindeki sembolleri (BTC/USDT, ARB/USDT ...) alır,
-    BingX 1D OHLCV verisinde EMA 13-34 / 34-89 bullish cross tarar.
+    BingX'ten 1D OHLCV çeker ve EMA 13-34 / 34-89 bullish cross tarar.
     """
     result = {
         "13_34_bull": [],
@@ -374,13 +388,15 @@ def scan_crypto_from_bingx_list() -> dict:
         result["debug"] = f"{BINANCE_LIST_FILE} boş veya bulunamadı."
         return result
 
+    raw_count = len(symbols)
+
     # BingX borsasını başlat
     try:
         exchange = ccxt.bingx({
             "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
         })
-        exchange.load_markets()
-        markets = exchange.markets
+        markets = exchange.load_markets()
     except Exception as e:
         msg = f"BingX borsası başlatılamadı: {e}"
         print(msg)
@@ -388,60 +404,87 @@ def scan_crypto_from_bingx_list() -> dict:
         return result
 
     processed_count = 0
+    mapped_count = 0
 
     for sym in symbols:
-        sym = sym.strip()
-        if not sym:
+        sym_clean = sym.strip()
+        if not sym_clean:
             continue
 
-        bingx_symbol = map_binance_to_bingx_symbol(sym, markets)
-        if bingx_symbol is None:
-            msg = f"{sym}: BingX'te uygun market bulunamadı"
+        market_symbol = map_binance_to_bingx_symbol(sym_clean, markets)
+        if market_symbol is None:
+            msg = f"{sym_clean}: BingX'te uygun market bulunamadı"
             print(msg)
             result["errors"].append(msg)
             continue
 
+        mapped_count += 1
+
         try:
             ohlcv = exchange.fetch_ohlcv(
-                bingx_symbol,
+                market_symbol,
                 timeframe=CRYPTO_TIMEFRAME,
                 limit=CRYPTO_OHLC_LIMIT,
             )
         except Exception as e:
-            msg = f"{sym} ({bingx_symbol}): {e}"
+            msg = f"{sym_clean} ({market_symbol}): {e}"
             print("Kripto veri hatası:", msg)
             result["errors"].append(msg)
             continue
 
         if not ohlcv or len(ohlcv) < 60:
-            msg = f"{sym} ({bingx_symbol}): yetersiz OHLCV verisi"
+            msg = f"{sym_clean} ({market_symbol}): yetersiz OHLCV verisi"
             print(msg)
             result["errors"].append(msg)
             continue
 
+        # ccxt -> pandas.Series (close)
         closes = pd.Series(
             [c[4] for c in ohlcv],
             index=pd.to_datetime([c[0] for c in ohlcv], unit="ms", utc=True),
-        ).astype(float)
+            dtype=float,
+        )
 
-        # Sinyalde coin adını 'BTC', 'ARB' gibi gösterelim
-        display_name = sym.replace("/USDT", "").replace("USDT", "")
+        # Sinyalde sadece coin adını gösterelim (BTC, ARB gibi)
+        display_name = sym_clean.replace("/USDT", "").replace("USDT", "")
 
-        # Kriptoda minicik kesişimleri elemek için hafif gap filtresi
-        if has_recent_bullish_cross(closes, 13, 34, min_rel_gap=0.0005):
-            result["13_34_bull"].append(display_name)
+        try:
+            # Kriptoda minicik kesişimleri elemek için:
+            #  - sadece SON mumda kesişim (max_bars_ago=0)
+            #  - gap en az %0.3 (min_rel_gap=0.003)
+            if has_recent_bullish_cross(
+                closes,
+                fast=13,
+                slow=34,
+                max_bars_ago=0,
+                min_rel_gap=0.003,
+            ):
+                result["13_34_bull"].append(display_name)
 
-        if has_recent_bullish_cross(closes, 34, 89, min_rel_gap=0.0005):
-            result["34_89_bull"].append(display_name)
+            if has_recent_bullish_cross(
+                closes,
+                fast=34,
+                slow=89,
+                max_bars_ago=0,
+                min_rel_gap=0.003,
+            ):
+                result["34_89_bull"].append(display_name)
 
-        processed_count += 1
+            processed_count += 1
+
+        except Exception as e:
+            msg = f"{sym_clean}: hesap hatası -> {e}"
+            print(msg)
+            result["errors"].append(msg)
+            continue
 
     c13 = len(result["13_34_bull"])
     c34 = len(result["34_89_bull"])
 
     result["debug"] = (
-        f"Kaynak: BingX 1D. Binance listesinden {len(symbols)} sembol okundu, "
-        f"geçerli veri: {processed_count}. "
+        f"Kaynak: BingX 1D. Binance listesinden {raw_count} satır okundu, "
+        f"BingX'te market bulunan: {mapped_count}, "
+        f"geçerli veri çekilen: {processed_count}. "
         f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
     )
 
@@ -475,7 +518,7 @@ def main():
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
         f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (BingX 1D)\n"
-        f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
+        f"NOT: Sadece son 1 mumda (max 0–1 bar) oluşmuş güçlü bullish kesişimler listelenir."
     )
     send_telegram_message(header)
 
