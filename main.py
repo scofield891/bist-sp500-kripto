@@ -4,6 +4,10 @@ import requests
 
 import yfinance as yf
 import pandas as pd
+from dotenv import load_dotenv
+
+# .env varsa lokal çalıştırırken de BOT_TOKEN / CHAT_ID gelsin
+load_dotenv()
 
 # =============== Ayarlar ===============
 
