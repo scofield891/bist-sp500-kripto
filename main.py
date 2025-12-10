@@ -4,10 +4,7 @@ import requests
 
 import yfinance as yf
 import pandas as pd
-import ccxt
 from dotenv import load_dotenv
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # .env varsa lokal çalıştırırken de BOT_TOKEN / CHAT_ID gelsin
 load_dotenv()
@@ -35,10 +32,6 @@ BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
 # Kripto tarafı: Binance sembol listesi dosyası (BTC/USDT, ETH/USDT, ...)
 BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
-
-# Kripto zaman aralığı ve mum sayısı
-CRYPTO_TIMEFRAME = "1d"
-CRYPTO_OHLC_LIMIT = 400  # EMA için rahat yeter
 
 
 # =============== Telegram ===============
@@ -322,162 +315,78 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== KRİPTO: Binance listesi, Bybit 1D (swap) ===============
+# =============== KRİPTO: Yahoo Finance (Binance listesi) ===============
 
-def configure_bybit_session(exchange, pool: int = 30):
+def scan_crypto_via_yfinance(symbol_file: str = BINANCE_LIST_FILE, universe_name: str = "Kripto (Yahoo)"):
     """
-    Bybit için requests oturumu (connection pool + retry ayarı).
+    binance.txt içindeki sembolleri (BTC/USDT, ARB/USDT ...) alır,
+    Yahoo Finance formatına (BTC-USD, ARB-USD ...) çevirir
+    ve scan_equity_universe ile EMA 13-34 / 34-89 bullish cross tarar.
     """
-    s = requests.Session()
-    adapter = HTTPAdapter(
-        pool_connections=pool,
-        pool_maxsize=pool,
-        max_retries=Retry(
-            total=3,
-            backoff_factor=0.3,
-            status_forcelist=[429, 500, 502, 503, 504],
-        ),
-    )
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    exchange.session = s
+    raw_symbols = read_symbol_file(symbol_file)
 
+    if not raw_symbols:
+        return {
+            "13_34_bull": [],
+            "34_89_bull": [],
+            "errors": [],
+            "debug": f"{symbol_file} boş veya bulunamadı."
+        }
 
-def map_binance_to_bybit_symbol(binance_symbol, markets):
-    """
-    Binance sembolünü (BTC/USDT veya BTCUSDT) Bybit market adına map eder.
-    Öncelik:
-      1) BTC/USDT:USDT (USDT perpetual)
-      2) BTC/USDT      (spot, fallback)
-    """
-    s = binance_symbol.strip().upper()
-    if not s:
-        return None
+    yf_symbols = []
+    map_errors = []
 
-    # 'BTC/USDT' veya 'BTCUSDT' -> 'BTC'
-    if s.endswith("USDT"):
-        base = s.replace("/USDT", "").replace("USDT", "")
-    else:
-        base = s
-
-    candidates = [
-        f"{base}/USDT:USDT",  # USDT perpetual
-        f"{base}/USDT",       # spot (fallback)
-    ]
-
-    for c in candidates:
-        if c in markets:
-            return c
-
-    return None
-
-
-def scan_crypto_bybit_from_file(
-    symbol_file: str = BINANCE_LIST_FILE,
-    timeframe: str = CRYPTO_TIMEFRAME,
-    limit: int = CRYPTO_OHLC_LIMIT
-) -> dict:
-    """
-    Binance sembol listesi dosyasını (BTC/USDT, ARB/USDT ...) okuyup,
-    Bybit USDT perpetual (swap) 1D mumları ile EMA 13-34 / EMA 34-89 bullish cross arar.
-
-    ✅ Veri kaynağı: Bybit (swap, USDT linear)
-    ✅ Havuz kaynağı: binance.txt (manuel seçtiğin coin listesi)
-    """
-    result = {
-        "13_34_bull": [],
-        "34_89_bull": [],
-        "errors": [],
-        "debug": ""
-    }
-
-    symbols = read_symbol_file(symbol_file)
-    if not symbols:
-        result["debug"] = f"{symbol_file} boş veya bulunamadı."
-        return result
-
-    # Bybit borsasını SWAP modunda başlat
-    try:
-        exchange = ccxt.bybit({
-            "enableRateLimit": True,
-            "options": {"defaultType": "swap"},
-            "timeout": 90000,
-        })
-        configure_bybit_session(exchange, pool=50)
-        exchange.load_markets()
-        markets = exchange.markets
-    except Exception as e:
-        msg = f"Bybit borsası başlatılamadı: {e}"
-        print(msg)
-        result["errors"].append(msg)
-        return result
-
-    processed_count = 0
-
-    for bin_sym in symbols:
-        bin_sym_u = bin_sym.strip().upper()
-        if not bin_sym_u:
-            continue
-
-        # Binance sembolünü Bybit market string'ine çevir (BTC/USDT:USDT gibi)
-        market_symbol = map_binance_to_bybit_symbol(bin_sym_u, markets)
-        if market_symbol is None:
-            print("Bybit market bulunamadı:", bin_sym_u)
-            result["errors"].append(bin_sym_u)
+    for sym in raw_symbols:
+        s = sym.strip().upper()
+        if not s:
             continue
 
         try:
-            ohlcv = exchange.fetch_ohlcv(
-                market_symbol,
-                timeframe=timeframe,
-                limit=limit,
-            )
-        except Exception as e:
-            print("Bybit veri hatası:", bin_sym_u, market_symbol, "->", e)
-            result["errors"].append(bin_sym_u)
-            continue
+            # Örn: 'BTC/USDT' veya 'BTCUSDT' -> 'BTC-USD'
+            if "/" in s:
+                base, quote = s.split("/")
+                base = base.strip()
+            else:
+                # BTCUSDT gibi ise USDT kısmını at
+                base = s.replace("USDT", "").replace("USD", "").strip()
 
-        if not ohlcv or len(ohlcv) < 60:
-            msg = f"{bin_sym_u}: yetersiz OHLCV verisi"
-            print(msg)
-            result["errors"].append(bin_sym_u)
-            continue
+            if not base:
+                continue
 
-        closes = pd.Series(
-            [c[4] for c in ohlcv],
-            index=pd.to_datetime([c[0] for c in ohlcv], unit="ms", utc=True),
-        )
-
-        # Çıktıda "BTC/USDT" formatı gözüksün
-        pretty_name = bin_sym_u
-        if "/" not in pretty_name and pretty_name.endswith("USDT"):
-            pretty_name = pretty_name.replace("USDT", "/USDT")
-
-        try:
-            # Kriptoda çok minik kesişimleri elemek için hafif gap filtresi (%0.05)
-            if has_recent_bullish_cross(closes, 13, 34, min_rel_gap=0.0005):
-                result["13_34_bull"].append(pretty_name)
-
-            if has_recent_bullish_cross(closes, 34, 89, min_rel_gap=0.0005):
-                result["34_89_bull"].append(pretty_name)
-
-            processed_count += 1
+            yahoo_sym = f"{base}-USD"
+            yf_symbols.append(yahoo_sym)
 
         except Exception as e:
-            print("Kripto hesap hatası:", bin_sym_u, "->", e)
-            result["errors"].append(bin_sym_u)
-            continue
+            map_errors.append(f"{sym}: map hatası {e}")
 
-    c13 = len(result["13_34_bull"])
-    c34 = len(result["34_89_bull"])
+    if not yf_symbols:
+        return {
+            "13_34_bull": [],
+            "34_89_bull": [],
+            "errors": map_errors,
+            "debug": "Yahoo için sembol üretilemedi."
+        }
 
-    result["debug"] = (
-        f"Kaynak: Bybit 1D (swap). Binance listesinden {len(symbols)} sembol okundu, "
-        f"geçerli veri: {processed_count}. "
-        f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
+    print(
+        f"{universe_name}: binance.txt içinden {len(raw_symbols)} satır okundu, "
+        f"Yahoo formatında {len(yf_symbols)} sembol üretildi."
     )
 
-    return result
+    # Mevcut ortak tarayıcıyı kullan
+    res = scan_equity_universe(yf_symbols, universe_name)
+
+    # Ek hata bilgilerini de ekle
+    res.setdefault("errors", [])
+    res["errors"].extend(map_errors)
+
+    res["debug"] = (
+        f"Kaynak: Yahoo Finance (Kripto). Binance listesinden {len(raw_symbols)} satır okundu, "
+        f"Yahoo formatına çevrilen: {len(yf_symbols)}. "
+        f"Sinyaller -> 13/34: {len(res['13_34_bull'])} adet, "
+        f"34/89: {len(res['34_89_bull'])} adet."
+    )
+
+    return res
 
 
 # =============== Formatlama ===============
@@ -488,8 +397,8 @@ def format_result_block(title: str, res: dict) -> str:
     def join_list(lst):
         return ", ".join(lst) if lst else "-"
 
-    lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res['13_34_bull'])}")
-    lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res['34_89_bull'])}")
+    lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res.get('13_34_bull', []))}")
+    lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res.get('34_89_bull', []))}")
 
     err_line = summarize_errors(res.get("errors", []))
     if err_line:
@@ -506,7 +415,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (Binance listesi, Bybit 1D)\n"
+        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (Yahoo Finance)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -538,13 +447,9 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Kripto (Binance listesi, Bybit 1D) --- #
-    crypto_res = scan_crypto_bybit_from_file(
-        symbol_file=BINANCE_LIST_FILE,
-        timeframe=CRYPTO_TIMEFRAME,
-        limit=CRYPTO_OHLC_LIMIT
-    )
-    crypto_text = format_result_block("🪙 Kripto (Binance listesi, Bybit 1D)", crypto_res)
+    # --- Kripto (Binance listesi, Yahoo Finance 1D) --- #
+    crypto_res = scan_crypto_via_yfinance(BINANCE_LIST_FILE, "Kripto (Yahoo)")
+    crypto_text = format_result_block("🪙 Kripto (Binance listesi, Yahoo 1D)", crypto_res)
     send_telegram_message(crypto_text)
 
     dbg = crypto_res.get("debug")
