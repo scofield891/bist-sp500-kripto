@@ -5,7 +5,6 @@ import requests
 import yfinance as yf
 import pandas as pd
 
-
 # =============== Ayarlar ===============
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -15,6 +14,17 @@ if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
 TIMEFRAME_DAYS = "1d"  # Günlük mum
+
+# ---- BIST evreni (havuz + likiditeye göre TOP N) ----
+# İçine 500+ BIST hissesini yazacağımız havuz dosyası
+BIST_ALL_FILE = os.getenv("BIST_ALL_FILE", "bist_all.txt")
+
+# Havuzdan en likit kaç hisse taransın? (default: 150)
+BIST_MAX_COUNT = int(os.getenv("BIST_MAX_COUNT", "150"))
+
+# Mesajlarda gözükecek label
+# Örn: "BIST Top 150 Likit"
+BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
 # Kripto tarafı ayarları (dinamik, marketcap top N)
 TOP_CRYPTO_MC = 200  # Marketcap'e göre en büyük kaç coin taransın?
@@ -37,7 +47,7 @@ def send_telegram_message(text: str):
 
 def read_symbol_file(path: str):
     """
-    bist100.txt / nasdaq100.txt gibi dosyalardan sembol listesi okur.
+    bist_all.txt / nasdaq100.txt gibi dosyalardan sembol listesi okur.
     Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
     """
     if not os.path.exists(path):
@@ -54,13 +64,108 @@ def read_symbol_file(path: str):
     return symbols
 
 
-def has_recent_bullish_cross(close: pd.Series, fast: int, slow: int) -> bool:
+def select_most_liquid_bist_symbols(
+    symbols,
+    max_count: int = 150,
+    lookback_days: int = 90,
+    min_days: int = 30,
+    universe_name: str = "BIST"
+):
+    """
+    Verilen BIST sembolleri arasından, son 'lookback_days' içinde
+    ortalama işlem değeri (Close * Volume) en yüksek olan ilk 'max_count'
+    hisseyi seçer.
+    """
+
+    if not symbols:
+        return []
+
+    try:
+        data = yf.download(
+            symbols,
+            period=f"{lookback_days}d",
+            interval=TIMEFRAME_DAYS,
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception as e:
+        print(f"{universe_name} likidite indirme hatası:", e)
+        # Hata olursa fallback: tüm sembolleri aynen döndür
+        return symbols
+
+    multi = isinstance(data.columns, pd.MultiIndex)
+    liquidity_list = []
+
+    for sym in symbols:
+        try:
+            if multi:
+                if sym not in data.columns.levels[0]:
+                    # Bu sembol için veri yok
+                    continue
+                df_sym = data[sym].dropna()
+            else:
+                # Tek sembol durumu
+                df_sym = data
+
+            if df_sym.empty:
+                continue
+
+            # Gerekli kolonlar yoksa atla
+            if "Close" not in df_sym.columns or "Volume" not in df_sym.columns:
+                continue
+
+            # Son 60 barı alsak yeterli
+            df_recent = df_sym.tail(60)
+            if len(df_recent) < min_days:
+                # çok az veri, sağlıklı bir ortalama değil
+                continue
+
+            # Ortalama işlem değeri (TL): Close * Volume
+            avg_value = (df_recent["Close"] * df_recent["Volume"]).mean()
+
+            if pd.isna(avg_value) or avg_value <= 0:
+                continue
+
+            liquidity_list.append((sym, avg_value))
+
+        except Exception as e:
+            print(f"Likidite hesap hatası {sym}: {e}")
+            continue
+
+    if not liquidity_list:
+        # Hiç veri alamadıysak fallback
+        print(f"{universe_name} için likidite listesi boş, fallback ile tüm semboller kullanılacak.")
+        return symbols
+
+    # En yüksekten en düşüğe sırala
+    liquidity_list.sort(key=lambda x: x[1], reverse=True)
+
+    # İlk max_count kadarını al
+    top_syms = [sym for sym, _ in liquidity_list[:max_count]]
+
+    print(
+        f"{universe_name}: {len(symbols)} sembolden likiditeye göre "
+        f"ilk {len(top_syms)} seçildi (max_count={max_count})."
+    )
+
+    return top_syms
+
+
+def has_recent_bullish_cross(
+    close: pd.Series,
+    fast: int,
+    slow: int,
+    max_bars_ago: int = 1,   # en fazla kaç bar önce? 1 = son bar veya bir önceki bar
+    max_days_ago: int = 2    # en fazla kaç takvim günü önce?
+) -> bool:
     """
     EMA fast & slow için bullish cross noktalarını bulur.
-    Son bullish cross, son mumda veya bir önceki mumdaysa True döner.
-    Aksi halde False.
 
-    Bullish cross: EMA_fast > EMA_slow durumunun False -> True'ya geçtiği bar.
+    Şartlar:
+      - Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
+      - Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
     """
     if len(close) < slow + 3:
         return False
@@ -81,8 +186,36 @@ def has_recent_bullish_cross(close: pd.Series, fast: int, slow: int) -> bool:
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
 
-    # Son mum (last_idx) veya ondan bir önceki mum (last_idx - 1) kabul
-    return last_cross >= last_idx - 1
+    # 1) Bar bazlı kontrol: son bar veya bir önceki bar içinde mi?
+    if last_cross < last_idx - max_bars_ago:
+        return False
+
+    # 2) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
+    idx = close.index
+    if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
+        try:
+            last_cross_time = idx[last_cross]
+
+            # PeriodIndex ise timestamp'e çevir
+            if isinstance(last_cross_time, pd.Period):
+                last_cross_time = last_cross_time.to_timestamp()
+
+            # timezone'lu ise UTC'ye çevir, sonra naive yap
+            if getattr(last_cross_time, "tzinfo", None) is not None:
+                last_cross_time = last_cross_time.tz_convert("UTC").tz_localize(None)
+
+            # Bugünün UTC tarihi (saat silinmiş)
+            today_utc = pd.Timestamp.utcnow().normalize()
+            cross_day = pd.Timestamp(last_cross_time).normalize()
+            days_diff = (today_utc - cross_day).days
+
+            if days_diff > max_days_ago:
+                return False
+        except Exception as e:
+            # Tarih dönüşümünde hata olursa sadece bar filtresine göre karar verir
+            print("Tarih kontrolü hatası (has_recent_bullish_cross):", e)
+
+    return True
 
 
 def summarize_errors(errors, max_show: int = 10) -> str:
@@ -225,8 +358,6 @@ def scan_crypto_top_mcap(limit: int = 200):
     2) Stable / wrapped olma ihtimali yüksek olanları sembolden eleyip,
        kalanları Yahoo Finance formatına (BTC-USD, ETH-USD) çevirir.
     3) Tek seferde toplu indirip EMA kesişimi arar.
-
-    AVANTAJ: Rate limit derdi yok, çok hızlı, ccxt yok.
     """
     result = {
         "13_34_bull": [],
@@ -385,21 +516,34 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: BIST 100, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} "
+        f"Evren: {BIST_LABEL}, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} "
         f"(Marketcap, Yahoo Finance)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
 
-    # --- BIST 100 --- #
-    bist_symbols = read_symbol_file("bist100.txt")
-    if bist_symbols:
-        bist_res = scan_equity_universe(bist_symbols, "BIST 100")
-        bist_text = format_result_block("🇹🇷 BIST 100", bist_res)
-        send_telegram_message(bist_text)
+    # --- BIST (havuzdan likiditeye göre TOP N) --- #
+    bist_all = read_symbol_file(BIST_ALL_FILE)
+
+    if bist_all:
+        # Havuzdan en likit BIST_MAX_COUNT hissenin seçilmesi
+        bist_symbols = select_most_liquid_bist_symbols(
+            bist_all,
+            max_count=BIST_MAX_COUNT,
+            universe_name="BIST Likit"
+        )
+
+        if bist_symbols:
+            bist_res = scan_equity_universe(bist_symbols, "BIST Likit")
+            # Gerçekte seçilen sayıyı label'a ve mesaja yansıtalım
+            bist_label_full = f"{BIST_LABEL} ({len(bist_symbols)} hisse)"
+            bist_text = format_result_block(f"🇹🇷 {bist_label_full}", bist_res)
+            send_telegram_message(bist_text)
+    else:
+        print(f"{BIST_ALL_FILE} bulunamadı, BIST taraması yapılmayacak.")
 
     # --- S&P 500 (nasdaq100.txt dosyasından okunuyor) --- #
-    sp500_symbols = read_symbol_file("nasdaq100.txt")  # içine SP200 de koymuş olabilirsin, isim önemli değil
+    sp500_symbols = read_symbol_file("nasdaq100.txt")
     if sp500_symbols:
         sp500_res = scan_equity_universe(sp500_symbols, "S&P 500")
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
