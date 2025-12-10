@@ -168,8 +168,9 @@ def has_recent_bullish_cross(
     EMA fast & slow için bullish cross noktalarını bulur.
 
     Şartlar:
-      - Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
-      - Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
+      1) EMA_fast şu anda EMA_slow'un ÜSTÜNDE olacak (trend hâlâ bullish).
+      2) Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
+      3) Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
     """
     if len(close) < slow + 3:
         return False
@@ -179,6 +180,12 @@ def has_recent_bullish_cross(
 
     fast_above = ema_fast > ema_slow  # boolean seri
 
+    # 0) Şu anda gerçekten bullish mi? (EMA_fast > EMA_slow)
+    # Eğer şu an tekrar altına inmişse, sinyali geçersiz say.
+    if not fast_above.iloc[-1]:
+        return False
+
+    # 1) Geçmişte bullish cross olan barları bul
     cross_indices = []
     for i in range(1, len(fast_above)):
         if fast_above.iloc[i] and not fast_above.iloc[i - 1]:
@@ -190,11 +197,11 @@ def has_recent_bullish_cross(
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
 
-    # 1) Bar bazlı kontrol: son bar veya bir önceki bar içinde mi?
+    # 2) Bar bazlı kontrol: son bar veya en fazla max_bars_ago bar önce mi?
     if last_cross < last_idx - max_bars_ago:
         return False
 
-    # 2) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
+    # 3) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         try:
