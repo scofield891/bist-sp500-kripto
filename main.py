@@ -4,6 +4,7 @@ import requests
 
 import yfinance as yf
 import pandas as pd
+import ccxt
 from dotenv import load_dotenv
 
 # .env varsa lokal çalıştırırken de BOT_TOKEN / CHAT_ID gelsin
@@ -17,7 +18,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN ve CHAT_ID ortam değişkenlerini ayarla.")
 
-TIMEFRAME_DAYS = "1d"  # Günlük mum
+TIMEFRAME_DAYS = "1d"  # Günlük mum (yfinance & Bybit 1D)
 
 # ---- BIST evreni (havuz + likiditeye göre TOP N) ----
 # İçine 500+ BIST hissesini yazacağımız havuz dosyası
@@ -30,9 +31,8 @@ BIST_MAX_COUNT = int(os.getenv("BIST_MAX_COUNT", "150"))
 # Örn: "BIST Top 150 Likit"
 BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
-# Kripto tarafı ayarları (dinamik, marketcap top N)
-TOP_CRYPTO_MC = 200  # Marketcap'e göre en büyük kaç coin taransın?
-
+# Kripto tarafı: Binance sembol listesi dosyası (BTCUSDT, ETHUSDT, ...)
+BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
 
 # =============== Telegram ===============
 
@@ -51,7 +51,7 @@ def send_telegram_message(text: str):
 
 def read_symbol_file(path: str):
     """
-    bist_all.txt / nasdaq100.txt gibi dosyalardan sembol listesi okur.
+    bist_all.txt / nasdaq100.txt / binance.txt gibi dosyalardan sembol listesi okur.
     Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
     """
     if not os.path.exists(path):
@@ -162,15 +162,17 @@ def has_recent_bullish_cross(
     fast: int,
     slow: int,
     max_bars_ago: int = 1,   # en fazla kaç bar önce? 1 = son bar veya bir önceki bar
-    max_days_ago: int = 2    # en fazla kaç takvim günü önce?
+    max_days_ago: int = 2,   # en fazla kaç takvim günü önce?
+    min_rel_gap: float = 0.0 # cross anında min fark (gap/price), 0 ise kontrol yok
 ) -> bool:
     """
     EMA fast & slow için bullish cross noktalarını bulur.
 
     Şartlar:
-      1) EMA_fast şu anda EMA_slow'un ÜSTÜNDE olacak (trend hâlâ bullish).
-      2) Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
-      3) Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
+      - Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
+      - Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
+      - Eğer min_rel_gap > 0 ise: cross barında EMA_fast - EMA_slow,
+        fiyata oranla en az min_rel_gap olmalı (çok ufak kesişimleri elemek için).
     """
     if len(close) < slow + 3:
         return False
@@ -180,12 +182,6 @@ def has_recent_bullish_cross(
 
     fast_above = ema_fast > ema_slow  # boolean seri
 
-    # 0) Şu anda gerçekten bullish mi? (EMA_fast > EMA_slow)
-    # Eğer şu an tekrar altına inmişse, sinyali geçersiz say.
-    if not fast_above.iloc[-1]:
-        return False
-
-    # 1) Geçmişte bullish cross olan barları bul
     cross_indices = []
     for i in range(1, len(fast_above)):
         if fast_above.iloc[i] and not fast_above.iloc[i - 1]:
@@ -197,11 +193,24 @@ def has_recent_bullish_cross(
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
 
-    # 2) Bar bazlı kontrol: son bar veya en fazla max_bars_ago bar önce mi?
+    # 1) Bar bazlı kontrol: son bar veya bir önceki bar içinde mi?
     if last_cross < last_idx - max_bars_ago:
         return False
 
-    # 3) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
+    # 1.5) Gap kontrolü (isteğe bağlı)
+    if min_rel_gap > 0:
+        try:
+            gap = float(ema_fast.iloc[last_cross] - ema_slow.iloc[last_cross])
+            price = float(close.iloc[last_cross])
+            if price <= 0 or gap <= 0:
+                return False
+            if gap / price < min_rel_gap:
+                return False
+        except Exception as e:
+            print("Gap kontrolü hatası (has_recent_bullish_cross):", e)
+            return False
+
+    # 2) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         try:
@@ -305,70 +314,46 @@ def scan_equity_universe(symbols, universe_name: str):
     return result
 
 
-# =============== Kripto: Marketcap Top 200 (Yfinance Modu, Stable Temiz) ===============
+# =============== Kripto: Binance listesi, Bybit datası ===============
 
-def get_top_crypto_symbols_by_marketcap(limit: int = 200):
+def map_binance_to_bybit_symbol(binance_symbol: str, markets: dict) -> str | None:
     """
-    CoinGecko üzerinden, marketcap'e göre en büyük 'limit' coinin sembollerini çeker.
-    Örn: ['BTC', 'ETH', 'USDT', 'BNB', ...] (BÜYÜK HARF).
+    Binance sembolü (BTCUSDT, ETHUSDT, ARBUSDT ...) alır,
+    Bybit'teki muhtemel market adlarına map etmeye çalışır.
+
+    Öncelik:
+      1) BTC/USDT:USDT (perpetual)
+      2) BTC/USDT     (spot)
     """
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": limit,
-        "page": 1,
-        "sparkline": "false"
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    s = binance_symbol.strip().upper()
+    if not s:
+        return None
 
-    symbols = []
-    for coin in data:
-        sym = str(coin.get("symbol", "")).upper().strip()
-        if not sym:
-            continue
-        symbols.append(sym)
+    if s.endswith("USDT"):
+        base = s[:-4]
+    else:
+        base = s
 
-    return symbols
-
-
-def is_probable_stable_symbol(sym: str) -> bool:
-    """
-    Sembol bazlı kaba stable filtre:
-    - Bilinen stable / wrapped listesi
-    - USD, EUR, TRY, GBP, CNY ile biten coin sembollerini de şüpheli sayıp eler.
-    """
-    s = sym.upper()
-
-    ignored_coins = [
-        # Klasik stable'lar
-        "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDD", "USDP",
-        "USDE", "PYUSD", "GHO",
-        "FRAX", "LUSD",
-        # EUR bazlı
-        "EURS", "EURI", "EURT",
-        # Wrapped / staked
-        "WBTC", "WETH", "STETH", "WBETH",
+    candidates = [
+        f"{base}/USDT:USDT",  # USDT perpetual
+        f"{base}/USDT",       # spot
     ]
 
-    if s in ignored_coins:
-        return True
+    for c in candidates:
+        if c in markets:
+            return c
 
-    # Sondan stable / fiat çağrışımlı takılar
-    if s.endswith(("USD", "EUR", "TRY", "GBP", "CNY")):
-        return True
-
-    return False
+    return None
 
 
-def scan_crypto_top_mcap(limit: int = 200):
+def scan_crypto_bybit_from_file(
+    symbol_file: str = BINANCE_LIST_FILE,
+    timeframe: str = "1d",
+    limit: int = 400
+):
     """
-    1) CoinGecko'dan marketcap'e göre ilk 'limit' coini bulur.
-    2) Stable / wrapped olma ihtimali yüksek olanları sembolden eleyip,
-       kalanları Yahoo Finance formatına (BTC-USD, ETH-USD) çevirir.
-    3) Tek seferde toplu indirip EMA kesişimi arar.
+    Binance sembol listesi dosyasını (BTCUSDT, ETHUSDT, ...) okuyup,
+    Bybit 1D mumları ile EMA13-34 / EMA34-89 bullish cross arar.
     """
     result = {
         "13_34_bull": [],
@@ -377,126 +362,76 @@ def scan_crypto_top_mcap(limit: int = 200):
         "debug": ""
     }
 
+    symbols = read_symbol_file(symbol_file)
+    if not symbols:
+        result["debug"] = f"{symbol_file} boş veya bulunamadı."
+        return result
+
     try:
-        # 1) CoinGecko'dan listeyi çek
+        exchange = ccxt.bybit({"enableRateLimit": True})
+        exchange.load_markets()
+        markets = exchange.markets
+    except Exception as e:
+        msg = f"Bybit borsası başlatılamadı: {e}"
+        print(msg)
+        result["errors"].append(msg)
+        return result
+
+    processed_count = 0
+
+    for bin_sym in symbols:
+        bin_sym_u = bin_sym.strip().upper()
+        if not bin_sym_u:
+            continue
+
+        market_symbol = map_binance_to_bybit_symbol(bin_sym_u, markets)
+        if market_symbol is None:
+            print("Bybit market bulunamadı:", bin_sym_u)
+            result["errors"].append(bin_sym_u)
+            continue
+
         try:
-            cg_symbols = get_top_crypto_symbols_by_marketcap(limit=limit)
-        except Exception as e:
-            msg = f"CoinGecko hatası: {e}"
-            print(msg)
-            result["errors"].append(msg)
-            return result
-
-        # 2) Sembolleri stable filtresinden geçir, Yahoo formatına çevir
-        yf_tickers = []
-        original_map = {}  # YF sembolü -> Orijinal Coin sembolü
-        skipped_stables = []
-
-        for sym in cg_symbols:
-            sym_u = sym.upper()
-
-            # Stable / wrapped / fiat benzeri ise atla
-            if is_probable_stable_symbol(sym_u):
-                skipped_stables.append(sym_u)
-                continue
-
-            yf_sym = f"{sym_u}-USD"
-            yf_tickers.append(yf_sym)
-            original_map[yf_sym] = sym_u
-
-        if not yf_tickers:
-            result["debug"] = "Yahoo için uygun kripto sembolü bulunamadı (hepsi stable filtresine takıldı)."
-            return result
-
-        print(
-            f"Kripto taraması: CoinGecko top {limit}, "
-            f"stable filtresinden geçen: {len(yf_tickers)}, "
-            f"stable/fiat diye elenen: {len(skipped_stables)}"
-        )
-
-        # 3) Toplu İndirme
-        try:
-            data = yf.download(
-                yf_tickers,
-                period="400d",   # EMA için yeterli
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-                threads=True,
+            ohlcv = exchange.fetch_ohlcv(
+                market_symbol,
+                timeframe=timeframe,
+                limit=limit,
             )
         except Exception as e:
-            msg = f"Yfinance toplu indirme hatası: {e}"
-            print(msg)
-            result["errors"].append(msg)
-            return result
+            print("Bybit veri hatası:", bin_sym_u, market_symbol, "->", e)
+            result["errors"].append(bin_sym_u)
+            continue
 
-        multi = isinstance(data.columns, pd.MultiIndex)
-        processed_count = 0
+        if not ohlcv or len(ohlcv) < 50:
+            result["errors"].append(bin_sym_u)
+            continue
 
-        # Tek coin durumu
-        if not multi and len(yf_tickers) == 1:
-            single_sym = yf_tickers[0]
-            try:
-                close = data["Close"].dropna()
-                if not close.empty and len(close) >= 50:
-                    display_name = original_map.get(single_sym, single_sym)
-                    if has_recent_bullish_cross(close, 13, 34):
-                        result["13_34_bull"].append(display_name)
-                    if has_recent_bullish_cross(close, 34, 89):
-                        result["34_89_bull"].append(display_name)
-                    processed_count = 1
-            except Exception as e:
-                print("Tek kripto veri hatası:", e)
-        else:
-            # Çoklu sembol
-            for yf_sym in yf_tickers:
-                try:
-                    if multi:
-                        if yf_sym not in data.columns.levels[0]:
-                            # Yahoo'da olmayan sembol, geç
-                            continue
-                        df_sym = data[yf_sym]
-                    else:
-                        # Beklenmedik yapı, atla
-                        continue
-
-                    if "Close" not in df_sym.columns:
-                        continue
-
-                    close = df_sym["Close"].dropna()
-                    if close.empty or len(close) < 50:
-                        continue
-
-                    processed_count += 1
-
-                    display_name = original_map.get(yf_sym, yf_sym)
-
-                    if has_recent_bullish_cross(close, 13, 34):
-                        result["13_34_bull"].append(display_name)
-
-                    if has_recent_bullish_cross(close, 34, 89):
-                        result["34_89_bull"].append(display_name)
-
-                except Exception as e:
-                    # Tek sembol hata verirse tüm akışı bozmasın
-                    print("Kripto sembol hatası:", yf_sym, "->", e)
-                    continue
-
-        c13 = len(result["13_34_bull"])
-        c34 = len(result["34_89_bull"])
-
-        result["debug"] = (
-            f"Kaynak: Yahoo Finance (Kripto). "
-            f"Top mcap listesinden {len(cg_symbols)} coin çekildi. "
-            f"Stable/fiat filtresinden geçen: {len(yf_tickers)}, "
-            f"geçerli veri: {processed_count}. "
-            f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet. "
-            f"Stable/fiat diye elenen örnekler: {', '.join(skipped_stables[:10])}"
+        closes = pd.Series(
+            [c[4] for c in ohlcv],
+            index=pd.to_datetime([c[0] for c in ohlcv], unit="ms", utc=True),
         )
 
-    except Exception as e:
-        result["errors"].append(f"Genel Kripto Hatası: {e}")
+        try:
+            if has_recent_bullish_cross(closes, 13, 34):
+                result["13_34_bull"].append(bin_sym_u)
+
+            if has_recent_bullish_cross(closes, 34, 89):
+                result["34_89_bull"].append(bin_sym_u)
+
+            processed_count += 1
+
+        except Exception as e:
+            print("Kripto hesap hatası:", bin_sym_u, "->", e)
+            result["errors"].append(bin_sym_u)
+            continue
+
+    c13 = len(result["13_34_bull"])
+    c34 = len(result["34_89_bull"])
+
+    result["debug"] = (
+        f"Kaynak: Bybit 1D. Binance listesinden {len(symbols)} sembol okundu, "
+        f"geçerli veri: {processed_count}. "
+        f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
+    )
 
     return result
 
@@ -527,8 +462,7 @@ def main():
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
         f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
-        f"Evren: {BIST_LABEL}, S&P 500, Global Kripto Top {TOP_CRYPTO_MC} "
-        f"(Marketcap, Yahoo Finance)\n"
+        f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (Bybit)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
     send_telegram_message(header)
@@ -560,9 +494,9 @@ def main():
         sp500_text = format_result_block("🇺🇸 S&P 500", sp500_res)
         send_telegram_message(sp500_text)
 
-    # --- Kripto Top N (marketcap'e göre, dinamik, Yahoo Finance) --- #
-    crypto_res = scan_crypto_top_mcap(limit=TOP_CRYPTO_MC)
-    crypto_text = format_result_block(f"🪙 Kripto Top {TOP_CRYPTO_MC} (mcap, YF)", crypto_res)
+    # --- Kripto (Binance listesi, Bybit datası) --- #
+    crypto_res = scan_crypto_bybit_from_file(symbol_file=BINANCE_LIST_FILE, timeframe="1d", limit=400)
+    crypto_text = format_result_block("🪙 Kripto (Binance listesi, Bybit 1D)", crypto_res)
     send_telegram_message(crypto_text)
 
     dbg = crypto_res.get("debug")
