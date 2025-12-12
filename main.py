@@ -21,14 +21,8 @@ if not BOT_TOKEN or not CHAT_ID:
 TIMEFRAME_DAYS = "1d"  # Günlük mum (yfinance tarafı)
 
 # ---- BIST evreni (havuz + likiditeye göre TOP N) ----
-# İçine 500+ BIST hissesini yazacağımız havuz dosyası
 BIST_ALL_FILE = os.getenv("BIST_ALL_FILE", "bist_all.txt")
-
-# Havuzdan en likit kaç hisse taransın? (default: 150)
 BIST_MAX_COUNT = int(os.getenv("BIST_MAX_COUNT", "150"))
-
-# Mesajlarda gözükecek label
-# Örn: "BIST Top 150 Likit"
 BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
 # Kripto tarafı: Binance sembol listesi dosyası (BTC/USDT, ETH/USDT, ...)
@@ -45,7 +39,6 @@ def send_telegram_message(text: str):
             print("Telegram hata:", r.status_code, r.text)
     except Exception as e:
         print("Telegram gönderim hatası:", e)
-
 
 # =============== Ortak Yardımcılar ===============
 
@@ -80,7 +73,6 @@ def select_most_liquid_bist_symbols(
     ortalama işlem değeri (Close * Volume) en yüksek olan ilk 'max_count'
     hisseyi seçer.
     """
-
     if not symbols:
         return []
 
@@ -96,8 +88,7 @@ def select_most_liquid_bist_symbols(
         )
     except Exception as e:
         print(f"{universe_name} likidite indirme hatası:", e)
-        # Hata olursa fallback: tüm sembolleri aynen döndür
-        return symbols
+        return symbols  # fallback
 
     multi = isinstance(data.columns, pd.MultiIndex)
     liquidity_list = []
@@ -106,29 +97,22 @@ def select_most_liquid_bist_symbols(
         try:
             if multi:
                 if sym not in data.columns.levels[0]:
-                    # Bu sembol için veri yok
                     continue
                 df_sym = data[sym].dropna()
             else:
-                # Tek sembol durumu
                 df_sym = data
 
             if df_sym.empty:
                 continue
 
-            # Gerekli kolonlar yoksa atla
             if "Close" not in df_sym.columns or "Volume" not in df_sym.columns:
                 continue
 
-            # Son 60 barı alsak yeterli
             df_recent = df_sym.tail(60)
             if len(df_recent) < min_days:
-                # çok az veri, sağlıklı bir ortalama değil
                 continue
 
-            # Ortalama işlem değeri (TL): Close * Volume
             avg_value = (df_recent["Close"] * df_recent["Volume"]).mean()
-
             if pd.isna(avg_value) or avg_value <= 0:
                 continue
 
@@ -139,21 +123,16 @@ def select_most_liquid_bist_symbols(
             continue
 
     if not liquidity_list:
-        # Hiç veri alamadıysak fallback
         print(f"{universe_name} için likidite listesi boş, fallback ile tüm semboller kullanılacak.")
         return symbols
 
-    # En yüksekten en düşüğe sırala
     liquidity_list.sort(key=lambda x: x[1], reverse=True)
-
-    # İlk max_count kadarını al
     top_syms = [sym for sym, _ in liquidity_list[:max_count]]
 
     print(
         f"{universe_name}: {len(symbols)} sembolden likiditeye göre "
         f"ilk {len(top_syms)} seçildi (max_count={max_count})."
     )
-
     return top_syms
 
 
@@ -161,18 +140,18 @@ def has_recent_bullish_cross(
     close: pd.Series,
     fast: int,
     slow: int,
-    max_bars_ago: int = 1,   # en fazla kaç bar önce? 1 = son bar veya bir önceki bar
-    max_days_ago: int = 2,   # en fazla kaç takvim günü önce?
-    min_rel_gap: float = 0.0 # cross anında min fark (gap/price), 0 ise kontrol yok
+    max_bars_ago: int = 1,
+    max_days_ago: int = 2,
+    min_rel_gap: float = 0.0
 ) -> bool:
     """
     EMA fast & slow için bullish cross noktalarını bulur.
 
     Şartlar:
-      - Cross, son bar veya ondan en fazla max_bars_ago bar önce olacak.
+      - Cross, son bar veya en fazla max_bars_ago bar önce olacak.
       - Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
       - Eğer min_rel_gap > 0 ise: cross barında EMA_fast - EMA_slow,
-        fiyata oranla en az min_rel_gap olmalı (çok ufak kesişimleri elemek için).
+        fiyata oranla en az min_rel_gap olmalı.
     """
     if len(close) < slow + 3:
         return False
@@ -180,7 +159,7 @@ def has_recent_bullish_cross(
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
 
-    fast_above = ema_fast > ema_slow  # boolean seri
+    fast_above = ema_fast > ema_slow
 
     cross_indices = []
     for i in range(1, len(fast_above)):
@@ -193,11 +172,11 @@ def has_recent_bullish_cross(
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
 
-    # 1) Bar bazlı kontrol: son bar veya bir önceki bar içinde mi?
+    # 1) Bar bazlı kontrol
     if last_cross < last_idx - max_bars_ago:
         return False
 
-    # 1.5) Gap kontrolü (isteğe bağlı)
+    # 1.5) Gap kontrolü
     if min_rel_gap > 0:
         try:
             gap = float(ema_fast.iloc[last_cross] - ema_slow.iloc[last_cross])
@@ -210,21 +189,18 @@ def has_recent_bullish_cross(
             print("Gap kontrolü hatası (has_recent_bullish_cross):", e)
             return False
 
-    # 2) Tarih bazlı kontrol: cross barının tarihi bugünden max_days_ago günden eski olmasın
+    # 2) Tarih bazlı kontrol
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         try:
             last_cross_time = idx[last_cross]
 
-            # PeriodIndex ise timestamp'e çevir
             if isinstance(last_cross_time, pd.Period):
                 last_cross_time = last_cross_time.to_timestamp()
 
-            # timezone'lu ise UTC'ye çevir, sonra naive yap
             if getattr(last_cross_time, "tzinfo", None) is not None:
                 last_cross_time = last_cross_time.tz_convert("UTC").tz_localize(None)
 
-            # Bugünün UTC tarihi (saat silinmiş)
             today_utc = pd.Timestamp.utcnow().normalize()
             cross_day = pd.Timestamp(last_cross_time).normalize()
             days_diff = (today_utc - cross_day).days
@@ -232,7 +208,6 @@ def has_recent_bullish_cross(
             if days_diff > max_days_ago:
                 return False
         except Exception as e:
-            # Tarih dönüşümünde hata olursa sadece bar filtresine göre karar verir
             print("Tarih kontrolü hatası (has_recent_bullish_cross):", e)
 
     return True
@@ -253,11 +228,12 @@ def summarize_errors(errors, max_show: int = 10) -> str:
 def scan_equity_universe(symbols, universe_name: str):
     """
     yfinance ile TÜM sembolleri toplu indirip,
-    EMA 13-34 ve EMA 34-89 için son 1 mum (max 2 mum) bullish cross arar.
+    EMA 13-34, EMA 21-55 ve EMA 34-89 için son 1 mum (max 2 mum) bullish cross arar.
     Toplu indirme = daha az hata / rate limit.
     """
     result = {
         "13_34_bull": [],
+        "21_55_bull": [],
         "34_89_bull": [],
         "errors": []
     }
@@ -268,7 +244,7 @@ def scan_equity_universe(symbols, universe_name: str):
     try:
         data = yf.download(
             symbols,
-            period="400d",
+            period="400d",            # <- son 400 günlük veri
             interval=TIMEFRAME_DAYS,
             group_by="ticker",
             auto_adjust=False,
@@ -301,9 +277,11 @@ def scan_equity_universe(symbols, universe_name: str):
                 result["errors"].append(sym)
                 continue
 
-            # Hisse tarafı için min_rel_gap kullanmıyoruz (0 bırakıyoruz)
             if has_recent_bullish_cross(close, 13, 34):
                 result["13_34_bull"].append(sym)
+
+            if has_recent_bullish_cross(close, 21, 55):
+                result["21_55_bull"].append(sym)
 
             if has_recent_bullish_cross(close, 34, 89):
                 result["34_89_bull"].append(sym)
@@ -320,8 +298,7 @@ def scan_equity_universe(symbols, universe_name: str):
 CRYPTO_TIMEFRAME = "1d"
 CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
 
-
-def find_mexc_symbol(binance_symbol: str, markets: dict) -> str | None:
+def find_mexc_symbol(binance_symbol: str, markets: dict):
     """
     Binance tarzı sembolü (BTC/USDT veya BTCUSDT) alır,
     MEXC'te olası market adını tahmin eder.
@@ -337,11 +314,9 @@ def find_mexc_symbol(binance_symbol: str, markets: dict) -> str | None:
     if "/" in s:
         base, quote = s.split("/")
     else:
-        # BTCUSDT gibi gelirse
         if s.endswith("USDT"):
             base, quote = s[:-4], "USDT"
         else:
-            # Son çare: tümünü base kabul et
             base, quote = s, "USDT"
 
     candidates = [
@@ -359,10 +334,11 @@ def find_mexc_symbol(binance_symbol: str, markets: dict) -> str | None:
 def scan_crypto_from_mexc_list() -> dict:
     """
     binance.txt içindeki sembolleri (BTC/USDT, ARB/USDT ...) alır,
-    MEXC 1D OHLCV'den EMA 13-34 / 34-89 bullish cross tarar.
+    MEXC 1D OHLCV'den EMA 13-34 / 21-55 / 34-89 bullish cross tarar.
     """
     result = {
         "13_34_bull": [],
+        "21_55_bull": [],
         "34_89_bull": [],
         "errors": [],
         "debug": ""
@@ -373,7 +349,6 @@ def scan_crypto_from_mexc_list() -> dict:
         result["debug"] = f"{BINANCE_LIST_FILE} boş veya bulunamadı."
         return result
 
-    # MEXC borsasını başlat
     try:
         exchange = ccxt.mexc({
             "enableRateLimit": True,
@@ -420,19 +395,19 @@ def scan_crypto_from_mexc_list() -> dict:
             result["errors"].append(msg)
             continue
 
-        # ccxt -> close serisi
         df = pd.DataFrame(
             ohlcv,
             columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
         close = df["close"].astype(float)
 
-        # Sinyal tarafında sadece coin adını gösterelim (BTC, ARB gibi)
         display_name = raw_sym.replace("/USDT", "")
 
-        # Burada ekstra filtre yok, saf kesişim:
         if has_recent_bullish_cross(close, 13, 34, min_rel_gap=0.0):
             result["13_34_bull"].append(display_name)
+
+        if has_recent_bullish_cross(close, 21, 55, min_rel_gap=0.0):
+            result["21_55_bull"].append(display_name)
 
         if has_recent_bullish_cross(close, 34, 89, min_rel_gap=0.0):
             result["34_89_bull"].append(display_name)
@@ -440,13 +415,14 @@ def scan_crypto_from_mexc_list() -> dict:
         processed_count += 1
 
     c13 = len(result["13_34_bull"])
+    c21 = len(result["21_55_bull"])
     c34 = len(result["34_89_bull"])
 
     result["debug"] = (
         f"Kaynak: MEXC 1D. Binance listesinden {len(symbols)} satır okundu, "
         f"MEXC'te market bulunan: {have_market_count}, "
         f"geçerli veri çekilen: {processed_count}. "
-        f"Sinyaller -> 13/34: {c13} adet, 34/89: {c34} adet."
+        f"Sinyaller -> 13/34: {c13} adet, 21/55: {c21} adet, 34/89: {c34} adet."
     )
 
     return result
@@ -460,8 +436,9 @@ def format_result_block(title: str, res: dict) -> str:
     def join_list(lst):
         return ", ".join(lst) if lst else "-"
 
-    lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res['13_34_bull'])}")
-    lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res['34_89_bull'])}")
+    lines.append(f"EMA13-34 KESİŞİMİ : {join_list(res.get('13_34_bull', []))}")
+    lines.append(f"EMA21-55 KESİŞİMİ : {join_list(res.get('21_55_bull', []))}")
+    lines.append(f"EMA34-89 KESİŞİMİ : {join_list(res.get('34_89_bull', []))}")
 
     err_line = summarize_errors(res.get("errors", []))
     if err_line:
@@ -477,7 +454,7 @@ def main():
 
     header = (
         f"📊 EMA Yükseliş Kesişim Tarama – {today_str}\n"
-        f"Timeframe: 1D (EMA13-34 & EMA34-89)\n"
+        f"Timeframe: 1D (EMA13-34, EMA21-55 & EMA34-89)\n"
         f"Evren: {BIST_LABEL}, S&P 500, Seçili Kripto (MEXC 1D)\n"
         f"NOT: Sadece son 1 mumda veya en fazla 2 mum önce oluşmuş bullish kesişimler listelenir."
     )
@@ -487,7 +464,6 @@ def main():
     bist_all = read_symbol_file(BIST_ALL_FILE)
 
     if bist_all:
-        # Havuzdan en likit BIST_MAX_COUNT hissenin seçilmesi
         bist_symbols = select_most_liquid_bist_symbols(
             bist_all,
             max_count=BIST_MAX_COUNT,
@@ -496,14 +472,13 @@ def main():
 
         if bist_symbols:
             bist_res = scan_equity_universe(bist_symbols, "BIST Likit")
-            # Gerçekte seçilen sayıyı label'a ve mesaja yansıtalım
             bist_label_full = f"{BIST_LABEL} ({len(bist_symbols)} hisse)"
             bist_text = format_result_block(f"🇹🇷 {bist_label_full}", bist_res)
             send_telegram_message(bist_text)
     else:
         print(f"{BIST_ALL_FILE} bulunamadı, BIST taraması yapılmayacak.")
 
-    # --- S&P 500 (nasdaq100.txt dosyasından okunuyor) --- #
+    # --- S&P 500 (dosyadan okunuyor: nasdaq100.txt) --- #
     sp500_symbols = read_symbol_file("nasdaq100.txt")
     if sp500_symbols:
         sp500_res = scan_equity_universe(sp500_symbols, "S&P 500")
