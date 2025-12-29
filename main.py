@@ -42,9 +42,16 @@ CRYPTO_SPIKE_RATIO_MAX = float(os.getenv("CRYPTO_SPIKE_RATIO_MAX", "8"))  # max/
 # EMA cross için minimum gap (fake cross engellemek için)
 EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1
 
+def normalize_binance_base(url: str) -> str:
+    """Binance base URL'ini normalize eder (sonundaki /api/v3 veya / varsa kaldırır)."""
+    url = (url or "").strip().rstrip("/")
+    if url.endswith("/api/v3"):
+        url = url[:-7]
+    return url
+
 # Binance API base URL'leri (fallback sırasıyla denenir)
 BINANCE_API_BASES = [
-    os.getenv("BINANCE_API_BASE", "https://data-api.binance.vision"),
+    normalize_binance_base(os.getenv("BINANCE_API_BASE", "https://data-api.binance.vision")),
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
@@ -310,11 +317,19 @@ def has_recent_bullish_cross(
             if isinstance(last_cross_time, pd.Period):
                 last_cross_time = last_cross_time.to_timestamp()
 
-            if getattr(last_cross_time, "tzinfo", None) is not None:
-                last_cross_time = last_cross_time.tz_convert("UTC").tz_localize(None)
-
-            today_utc = pd.Timestamp.utcnow().normalize()
-            cross_day = pd.Timestamp(last_cross_time).normalize()
+            # UTC tz-aware today
+            today_utc = pd.Timestamp.now(tz="UTC").normalize()
+            
+            # cross_ts'i UTC tz-aware yap
+            cross_ts = pd.Timestamp(last_cross_time)
+            if cross_ts.tz is None:
+                # tz-naive ise UTC kabul et
+                cross_ts = cross_ts.tz_localize("UTC")
+            else:
+                # tz-aware ise UTC'ye çevir
+                cross_ts = cross_ts.tz_convert("UTC")
+            
+            cross_day = cross_ts.normalize()
             days_diff = (today_utc - cross_day).days
 
             if days_diff > max_days_ago:
@@ -517,8 +532,8 @@ def get_binance_30d_volume_stats(symbols: list) -> dict:
     # 24h hacme göre sırala (büyükten küçüğe)
     symbol_volumes.sort(key=lambda x: x[2], reverse=True)
     
-    # İlk TopK kadarını al (gereksiz klines çağrısı yapmamak için)
-    top_symbols = symbol_volumes[:CRYPTO_TOP_K + 50]  # Biraz buffer
+    # İlk TopK + buffer kadarını al (gereksiz klines çağrısı yapmamak için)
+    top_symbols = symbol_volumes[:CRYPTO_TOP_K + 150]  # Buffer artırıldı - gevşetmeye daha az ihtiyaç
     print(f"24h hacme göre ilk {len(top_symbols)} coin seçildi, klines çekiliyor...")
     
     # 3. Sadece seçilen coinler için 30 günlük klines çek
@@ -776,28 +791,19 @@ def remove_incomplete_candle(df: pd.DataFrame) -> pd.DataFrame:
     """
     Bugünkü tamamlanmamış mumu kaldırır.
     1D timeframe'de son bar bugünse atılır.
-    UTC timezone'u netleştirilerek off-by-one hatası önlenir.
+    Tüm karşılaştırmalar UTC tz-aware yapılır.
     """
     if df.empty:
         return df
     
-    # Son bar'ın timestamp'ini al
     last_ts = df["timestamp"].iloc[-1]
     
-    # Milisaniye cinsinden timestamp'i UTC datetime'a çevir ve tz-naive yap
-    if isinstance(last_ts, (int, float)):
-        last_date = pd.Timestamp(last_ts, unit="ms", tz="UTC").normalize().tz_localize(None)
-    else:
-        ts = pd.Timestamp(last_ts)
-        if ts.tzinfo is not None:
-            last_date = ts.tz_convert("UTC").normalize().tz_localize(None)
-        else:
-            last_date = ts.normalize()
+    # ccxt: ms int -> UTC tz-aware midnight
+    last_date = pd.Timestamp(int(last_ts), unit="ms", tz="UTC").normalize()
     
-    # Bugünün tarihini al (tz-naive)
-    today = pd.Timestamp.utcnow().normalize()
+    # UTC tz-aware today midnight
+    today = pd.Timestamp.now(tz="UTC").normalize()
     
-    # Eğer son bar bugünse, onu at
     if last_date >= today:
         return df.iloc[:-1]
     
@@ -894,9 +900,9 @@ def scan_crypto_from_mexc_list() -> tuple:
             result["errors"].append(raw_sym)
             continue
         
-        # Timestamp'i DatetimeIndex'e çevir (tarih kontrolü çalışsın)
+        # Timestamp'i DatetimeIndex'e çevir (tarih kontrolü çalışsın - UTC tz-aware)
         df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        close = pd.Series(df["close"].astype(float).values, index=df["dt"].dt.tz_convert(None))
+        close = pd.Series(df["close"].astype(float).values, index=df["dt"])
 
         display_name = extract_base_symbol(raw_sym)
 
@@ -922,14 +928,18 @@ def format_result_block(title: str, res: dict) -> str:
     """
     Sonuçları HTML formatında formatlar.
     Coin listesi <code> bloğunda monospace gösterilir.
+    Uzun listeler 25 coin/satır olarak bölünür.
     """
     lines = [f"<b>📌 {escape_html(title)}</b>"]
 
-    def format_coin_list(lst):
+    def format_coin_list(lst, per_line=25):
         if not lst:
             return "<i>-</i>"
-        # Coinleri monospace code bloğunda göster
-        coins_str = ", ".join(lst)
+        # Coin listesini satırlara böl (Telegram 4096 limit için)
+        result_lines = []
+        for i in range(0, len(lst), per_line):
+            result_lines.append(", ".join(lst[i:i+per_line]))
+        coins_str = "\n".join(result_lines)
         return f"<code>{escape_html(coins_str)}</code>"
 
     bull_list = res.get('13_34_bull', [])
