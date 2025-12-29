@@ -784,12 +784,17 @@ def remove_incomplete_candle(df: pd.DataFrame) -> pd.DataFrame:
     # Son bar'ın timestamp'ini al
     last_ts = df["timestamp"].iloc[-1]
     
-    # Milisaniye cinsinden timestamp'i UTC datetime'a çevir (timezone-aware -> naive)
+    # Milisaniye cinsinden timestamp'i UTC datetime'a çevir ve tz-naive yap
     if isinstance(last_ts, (int, float)):
         last_date = pd.Timestamp(last_ts, unit="ms", tz="UTC").normalize().tz_localize(None)
     else:
-        last_date = pd.Timestamp(last_ts, tz="UTC").normalize().tz_localize(None)
+        ts = pd.Timestamp(last_ts)
+        if ts.tzinfo is not None:
+            last_date = ts.tz_convert("UTC").normalize().tz_localize(None)
+        else:
+            last_date = ts.normalize()
     
+    # Bugünün tarihini al (tz-naive)
     today = pd.Timestamp.utcnow().normalize()
     
     # Eğer son bar bugünse, onu at
