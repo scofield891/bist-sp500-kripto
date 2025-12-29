@@ -42,6 +42,10 @@ CRYPTO_SPIKE_RATIO_MAX = float(os.getenv("CRYPTO_SPIKE_RATIO_MAX", "8"))  # max/
 # EMA cross için minimum gap (fake cross engellemek için)
 EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1
 
+# BIST/NASDAQ için pencere ayarları
+EQUITY_MAX_BARS_AGO = int(os.getenv("EQUITY_MAX_BARS_AGO", "2"))  # Son 2 bar
+EQUITY_MAX_DAYS_AGO = int(os.getenv("EQUITY_MAX_DAYS_AGO", "5"))  # Hafta sonu kaçırmasın
+
 def normalize_binance_base(url: str) -> str:
     """Binance base URL'ini normalize eder (sonundaki /api/v3 veya / varsa kaldırır)."""
     url = (url or "").strip().rstrip("/")
@@ -260,8 +264,8 @@ def has_recent_bullish_cross(
     close: pd.Series,
     fast: int,
     slow: int,
-    max_bars_ago: int = 1,
-    max_days_ago: int = 2,
+    max_bars_ago: int = 2,
+    max_days_ago: int = 5,
     min_rel_gap: float = 0.001
 ) -> bool:
     """
@@ -317,25 +321,28 @@ def has_recent_bullish_cross(
             if isinstance(last_cross_time, pd.Period):
                 last_cross_time = last_cross_time.to_timestamp()
 
-            # UTC tz-aware today
-            today_utc = pd.Timestamp.now(tz="UTC").normalize()
-            
-            # cross_ts'i UTC tz-aware yap
             cross_ts = pd.Timestamp(last_cross_time)
-            if cross_ts.tz is None:
-                # tz-naive ise UTC kabul et
-                cross_ts = cross_ts.tz_localize("UTC")
-            else:
-                # tz-aware ise UTC'ye çevir
-                cross_ts = cross_ts.tz_convert("UTC")
             
-            cross_day = cross_ts.normalize()
+            # BIST/yfinance tz-naive gelir, Kripto tz-aware gelir
+            # Her ikisini de aynı şekilde karşılaştır
+            if cross_ts.tz is None:
+                # tz-naive: today de tz-naive olsun
+                today_utc = pd.Timestamp.utcnow().replace(tzinfo=None).normalize()
+                cross_day = cross_ts.normalize()
+            else:
+                # tz-aware: UTC'ye çevir
+                today_utc = pd.Timestamp.now(tz="UTC").normalize()
+                cross_ts = cross_ts.tz_convert("UTC")
+                cross_day = cross_ts.normalize()
+            
             days_diff = (today_utc - cross_day).days
 
             if days_diff > max_days_ago:
                 return False
         except Exception as e:
             print("Tarih kontrolü hatası (has_recent_bullish_cross):", e)
+            # Tarih kontrolü başarısız olursa, bar bazlı kontrole güven
+            pass
 
     return True
 
@@ -401,7 +408,7 @@ def scan_equity_universe(symbols, universe_name: str):
                 result["errors"].append(sym)
                 continue
 
-            if has_recent_bullish_cross(close, 13, 34, min_rel_gap=EMA_MIN_REL_GAP):
+            if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP):
                 result["13_34_bull"].append(sym)
 
         except Exception as e:
@@ -906,7 +913,7 @@ def scan_crypto_from_mexc_list() -> tuple:
 
         display_name = extract_base_symbol(raw_sym)
 
-        if has_recent_bullish_cross(close, 13, 34, min_rel_gap=EMA_MIN_REL_GAP):
+        if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP):
             result["13_34_bull"].append(display_name)
 
         processed_count += 1
