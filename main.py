@@ -42,6 +42,14 @@ CRYPTO_SPIKE_RATIO_MAX = float(os.getenv("CRYPTO_SPIKE_RATIO_MAX", "8"))  # max/
 # EMA cross için minimum gap (fake cross engellemek için)
 EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1
 
+# Binance API base URL'leri (fallback sırasıyla denenir)
+BINANCE_API_BASES = [
+    os.getenv("BINANCE_API_BASE", "https://data-api.binance.vision"),
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+
 # Binance API rate limit bekleme süresi (saniye)
 BINANCE_RATE_LIMIT_SLEEP = float(os.getenv("BINANCE_RATE_LIMIT_SLEEP", "0.10"))
 
@@ -394,63 +402,216 @@ CRYPTO_TIMEFRAME = "1d"
 CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
 
 
+def binance_api_request(endpoint: str, params: dict = None, timeout: int = 15):
+    """
+    Binance API'ye istek atar.
+    - 429'da aynı base üzerinde exponential backoff ile retry
+    - 451/403/5xx'de sonraki base'e geç
+    """
+    if params is None:
+        params = {}
+    
+    per_base_retries = 3
+    backoff = 2
+    
+    for base in BINANCE_API_BASES:
+        url = f"{base}{endpoint}"
+        
+        for attempt in range(per_base_retries):
+            try:
+                r = requests.get(url, params=params, timeout=timeout)
+                
+                if r.status_code == 200:
+                    try:
+                        return r.json()
+                    except Exception:
+                        return None
+                
+                # 429: aynı base üzerinde bekle + retry
+                if r.status_code == 429:
+                    wait = backoff * (2 ** attempt)  # Exponential: 2, 4, 8
+                    print(f"[Binance] 429 Rate limit ({base}) → {wait}s bekle (attempt {attempt+1}/{per_base_retries})")
+                    time.sleep(wait)
+                    continue
+                
+                # 451/403/418 veya 5xx: base değiştir
+                if r.status_code in (451, 418, 403) or (500 <= r.status_code < 600):
+                    print(f"[Binance] HTTP {r.status_code} ({base}) → sonraki base")
+                    break
+                
+                # Diğer hatalar: base değiştir
+                print(f"[Binance] HTTP {r.status_code} ({base}) → sonraki base")
+                break
+                
+            except Exception as e:
+                print(f"[Binance] exception ({base}) → {e}")
+                break
+    
+    print("Tüm Binance base'leri başarısız!")
+    return None
+
+
+def get_binance_24h_volumes() -> dict:
+    """
+    Binance ticker/24hr endpoint'inden TÜM coinlerin 24h hacmini tek çağrıyla çeker.
+    Returns: {symbol: quote_volume, ...}  örn: {"BTCUSDT": 1234567890.5, ...}
+    """
+    data = binance_api_request("/api/v3/ticker/24hr")
+    if not data:
+        return {}
+    
+    volumes = {}
+    for ticker in data:
+        try:
+            symbol = ticker.get("symbol", "")
+            if symbol.endswith("USDT"):
+                quote_vol_str = ticker.get("quoteVolume", "0")
+                quote_vol = float(quote_vol_str) if quote_vol_str else 0
+                if quote_vol > 0:
+                    volumes[symbol] = quote_vol
+        except (ValueError, TypeError) as e:
+            # Parse hatası olursa bu coini atla
+            continue
+    
+    return volumes
+
+
+def get_binance_klines(symbol: str, limit: int = 30) -> list:
+    """
+    Tek bir sembol için klines çeker (fallback destekli).
+    """
+    params = {"symbol": symbol, "interval": "1d", "limit": limit}
+    return binance_api_request("/api/v3/klines", params)
+
+
 def get_binance_30d_volume_stats(symbols: list) -> dict:
     """
-    Binance public API'den 30 günlük kline çekip
-    hacim istatistikleri hesaplar:
-    - avg: ortalama günlük hacim
-    - median: medyan günlük hacim (spike'lara dayanıklı)
-    - max: en yüksek günlük hacim
-    - days_above_floor: kaç gün floor'un üstünde
-    - spike_ratio: max / median
+    Optimize edilmiş hacim istatistikleri:
+    1. Önce ticker/24hr ile tüm coinlerin anlık hacmini çek (tek istek)
+    2. Sembolleri 24h hacme göre ön-filtrele
+    3. Sadece filtrelenmiş coinler için 30 günlük klines çek
     
     Returns: {symbol: {avg, median, max, days_above, spike_ratio}, ...}
     """
     stats = {}
-    base_url = "https://api.binance.com/api/v3/klines"
+    
+    # 1. Önce 24h hacimlerini tek çağrıyla al
+    print("Binance'ten 24h hacim verisi çekiliyor (tek çağrı)...")
+    all_24h_volumes = get_binance_24h_volumes()
+    
+    if not all_24h_volumes:
+        print("24h hacim verisi alınamadı, doğrudan klines çekilecek...")
+        # Fallback: eski yöntemle devam et
+        return get_binance_30d_volume_stats_direct(symbols)
+    
+    print(f"24h hacim verisi alındı: {len(all_24h_volumes)} USDT çifti")
+    
+    # 2. Sembolleri 24h hacme göre filtrele ve sırala
+    symbol_volumes = []
+    for sym in symbols:
+        binance_symbol = sym.replace("/", "")
+        vol_24h = all_24h_volumes.get(binance_symbol, 0)
+        if vol_24h > 0:
+            symbol_volumes.append((sym, binance_symbol, vol_24h))
+    
+    # 24h hacme göre sırala (büyükten küçüğe)
+    symbol_volumes.sort(key=lambda x: x[2], reverse=True)
+    
+    # İlk TopK kadarını al (gereksiz klines çağrısı yapmamak için)
+    top_symbols = symbol_volumes[:CRYPTO_TOP_K + 50]  # Biraz buffer
+    print(f"24h hacme göre ilk {len(top_symbols)} coin seçildi, klines çekiliyor...")
+    
+    # 3. Sadece seçilen coinler için 30 günlük klines çek
+    for sym, binance_symbol, vol_24h in top_symbols:
+        try:
+            klines = get_binance_klines(binance_symbol, 30)
+            
+            if klines and len(klines) >= 7:
+                # Parse guard ile daily volumes çek
+                daily_volumes = []
+                for k in klines:
+                    try:
+                        daily_volumes.append(float(k[7]))
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                
+                if len(daily_volumes) < 7:
+                    time.sleep(BINANCE_RATE_LIMIT_SLEEP)
+                    continue
+                
+                avg_vol = sum(daily_volumes) / len(daily_volumes)
+                sorted_vols = sorted(daily_volumes)
+                n = len(sorted_vols)
+                if n % 2 == 0:
+                    median_vol = (sorted_vols[n // 2 - 1] + sorted_vols[n // 2]) / 2
+                else:
+                    median_vol = sorted_vols[n // 2]
+                max_vol = max(daily_volumes)
+                days_above = sum(1 for v in daily_volumes if v >= CRYPTO_FLOOR_VOLUME)
+                spike_ratio = max_vol / median_vol if median_vol > 0 else 999
+                
+                stats[sym] = {
+                    "avg": avg_vol,
+                    "median": median_vol,
+                    "max": max_vol,
+                    "days_above": days_above,
+                    "spike_ratio": spike_ratio
+                }
+            
+            time.sleep(BINANCE_RATE_LIMIT_SLEEP)
+            
+        except Exception as e:
+            print(f"Klines hatası {sym}: {e}")
+            continue
+    
+    return stats
+
+
+def get_binance_30d_volume_stats_direct(symbols: list) -> dict:
+    """
+    Fallback: Doğrudan her sembol için klines çeker (eski yöntem).
+    ticker/24hr çalışmazsa kullanılır.
+    """
+    stats = {}
     
     for sym in symbols:
-        # BTC/USDT -> BTCUSDT formatına çevir
         binance_symbol = sym.replace("/", "")
         
         try:
-            params = {
-                "symbol": binance_symbol,
-                "interval": "1d",
-                "limit": 30
-            }
+            klines = get_binance_klines(binance_symbol, 30)
             
-            r = requests.get(base_url, params=params, timeout=10)
-            
-            if r.status_code == 200:
-                klines = r.json()
-                if klines and len(klines) >= 7:  # En az 1 hafta veri olsun
-                    # quote_asset_volume (index 7) = USDT cinsinden hacim
-                    daily_volumes = [float(k[7]) for k in klines]
-                    
-                    avg_vol = sum(daily_volumes) / len(daily_volumes)
-                    sorted_vols = sorted(daily_volumes)
-                    n = len(sorted_vols)
-                    # Çift sayıda eleman için doğru median hesabı
-                    if n % 2 == 0:
-                        median_vol = (sorted_vols[n // 2 - 1] + sorted_vols[n // 2]) / 2
-                    else:
-                        median_vol = sorted_vols[n // 2]
-                    max_vol = max(daily_volumes)
-                    days_above = sum(1 for v in daily_volumes if v >= CRYPTO_FLOOR_VOLUME)
-                    spike_ratio = max_vol / median_vol if median_vol > 0 else 999
-                    
-                    stats[sym] = {
-                        "avg": avg_vol,
-                        "median": median_vol,
-                        "max": max_vol,
-                        "days_above": days_above,
-                        "spike_ratio": spike_ratio
-                    }
-            else:
-                print(f"Binance hacim hatası {sym}: HTTP {r.status_code}")
+            if klines and len(klines) >= 7:
+                # Parse guard ile daily volumes çek
+                daily_volumes = []
+                for k in klines:
+                    try:
+                        daily_volumes.append(float(k[7]))
+                    except (ValueError, TypeError, IndexError):
+                        continue
                 
-            # Rate limit için bekleme (0.10s daha güvenli)
+                if len(daily_volumes) < 7:
+                    time.sleep(BINANCE_RATE_LIMIT_SLEEP)
+                    continue
+                
+                avg_vol = sum(daily_volumes) / len(daily_volumes)
+                sorted_vols = sorted(daily_volumes)
+                n = len(sorted_vols)
+                if n % 2 == 0:
+                    median_vol = (sorted_vols[n // 2 - 1] + sorted_vols[n // 2]) / 2
+                else:
+                    median_vol = sorted_vols[n // 2]
+                max_vol = max(daily_volumes)
+                days_above = sum(1 for v in daily_volumes if v >= CRYPTO_FLOOR_VOLUME)
+                spike_ratio = max_vol / median_vol if median_vol > 0 else 999
+                
+                stats[sym] = {
+                    "avg": avg_vol,
+                    "median": median_vol,
+                    "max": max_vol,
+                    "days_above": days_above,
+                    "spike_ratio": spike_ratio
+                }
+                
             time.sleep(BINANCE_RATE_LIMIT_SLEEP)
             
         except Exception as e:
@@ -518,8 +679,8 @@ def filter_crypto_symbols(symbols: list) -> tuple:
     if not after_blacklist:
         return [], 0, 0
     
-    # 2. Binance'ten hacim istatistikleri çek
-    print(f"Binance'ten 30 günlük hacim istatistikleri çekiliyor ({len(after_blacklist)} sembol)...")
+    # 2. Binance'ten hacim istatistikleri çek (optimize edilmiş)
+    print(f"Binance'ten hacim istatistikleri çekiliyor ({len(after_blacklist)} sembol)...")
     volume_stats = get_binance_30d_volume_stats(after_blacklist)
     
     if not volume_stats:
