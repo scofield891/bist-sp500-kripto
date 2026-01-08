@@ -31,7 +31,8 @@ BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
 
 # ---- Kripto Filtreleme Parametreleri ----
 CRYPTO_TOP_K = int(os.getenv("CRYPTO_TOP_K", "320"))  # En likit kaç coin alınacak
-CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "200"))  # Minimum hedef coin sayısı
+CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "120"))  # Minimum hedef coin sayısı (gevşetme tetikleyici)
+CRYPTO_MAX_LEVEL = int(os.getenv("CRYPTO_MAX_LEVEL", "2"))  # Maksimum gevşeme seviyesi (0-1-2, Level 3'e düşmesin)
 
 # Tutarlılık filtreleri (başlangıç değerleri)
 CRYPTO_MEDIAN_MIN = float(os.getenv("CRYPTO_MEDIAN_MIN", "600000"))  # Median >= $600K
@@ -741,6 +742,11 @@ def filter_crypto_symbols(symbols: list) -> tuple:
     filtered_out = {}
     
     for level_idx, params in enumerate(relaxation_levels):
+        # Maksimum gevşeme seviyesini aşma
+        if level_idx > CRYPTO_MAX_LEVEL:
+            print(f"Maksimum gevşeme seviyesine ({CRYPTO_MAX_LEVEL}) ulaşıldı, daha fazla gevşetme yapılmayacak.")
+            break
+        
         final_list, filtered_out = apply_consistency_filter(
             top_k_symbols,
             params["median_min"],
