@@ -41,7 +41,8 @@ CRYPTO_FLOOR_VOLUME = float(os.getenv("CRYPTO_FLOOR_VOLUME", "500000"))  # $500K
 CRYPTO_SPIKE_RATIO_MAX = float(os.getenv("CRYPTO_SPIKE_RATIO_MAX", "8"))  # max/median <= 8
 
 # EMA cross için minimum gap (fake cross engellemek için)
-EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1
+EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1 (Kripto/NASDAQ)
+BIST_EMA_MIN_REL_GAP = float(os.getenv("BIST_EMA_MIN_REL_GAP", "0.0005"))  # %0.05 (BIST - daha gevşek)
 
 # BIST/NASDAQ için pencere ayarları
 EQUITY_MAX_BARS_AGO = int(os.getenv("EQUITY_MAX_BARS_AGO", "2"))  # Son 2 bar
@@ -360,11 +361,16 @@ def summarize_errors(errors, max_show: int = 10) -> str:
 
 # =============== Hisse Taraması (BIST & NASDAQ, toplu yfinance) ===============
 
-def scan_equity_universe(symbols, universe_name: str):
+def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
     """
     yfinance ile TÜM sembolleri toplu indirip,
     EMA 13-34 için son 1 mum (max 2 mum) bullish cross arar.
+    
+    min_gap: EMA gap kontrolü (None ise EMA_MIN_REL_GAP kullanılır)
     """
+    if min_gap is None:
+        min_gap = EMA_MIN_REL_GAP
+    
     result = {
         "13_34_bull": [],
         "errors": []
@@ -409,7 +415,7 @@ def scan_equity_universe(symbols, universe_name: str):
                 result["errors"].append(sym)
                 continue
 
-            if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP):
+            if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, min_gap):
                 result["13_34_bull"].append(sym)
 
         except Exception as e:
@@ -997,7 +1003,7 @@ def main():
         )
 
         if bist_symbols:
-            bist_res = scan_equity_universe(bist_symbols, "BIST Likit")
+            bist_res = scan_equity_universe(bist_symbols, "BIST Likit", min_gap=BIST_EMA_MIN_REL_GAP)
             bist_label_full = f"🇹🇷 {BIST_LABEL} ({len(bist_symbols)} hisse)"
             bist_text = format_result_block(bist_label_full, bist_res)
     else:
@@ -1008,7 +1014,7 @@ def main():
     nasdaq_text = None
     
     if nasdaq_symbols:
-        nasdaq_res = scan_equity_universe(nasdaq_symbols, "NASDAQ 100")
+        nasdaq_res = scan_equity_universe(nasdaq_symbols, "NASDAQ 100", min_gap=EMA_MIN_REL_GAP)
         nasdaq_text = format_result_block("🇺🇸 NASDAQ 100", nasdaq_res)
 
     # --- Kripto (TopK + Tutarlılık filtresi + MEXC mum verisi) --- #
