@@ -26,19 +26,16 @@ BIST_ALL_FILE = os.getenv("BIST_ALL_FILE", "bist_all.txt")
 BIST_MAX_COUNT = int(os.getenv("BIST_MAX_COUNT", "150"))
 BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 
-# Kripto tarafı: Binance sembol listesi dosyası (BTC/USDT, ETH/USDT, ...)
-BINANCE_LIST_FILE = os.getenv("BINANCE_LIST_FILE", "binance.txt")
+# Kripto tarafı: Midas sembol listesi dosyası
+CRYPTO_LIST_FILE = os.getenv("CRYPTO_LIST_FILE", "midas.txt")
 
 # ---- Kripto Filtreleme Parametreleri ----
-CRYPTO_TOP_K = int(os.getenv("CRYPTO_TOP_K", "320"))  # En likit kaç coin alınacak
-CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "120"))  # Minimum hedef coin sayısı (gevşetme tetikleyici)
-CRYPTO_MAX_LEVEL = int(os.getenv("CRYPTO_MAX_LEVEL", "2"))  # Maksimum gevşeme seviyesi (0-1-2, Level 3'e düşmesin)
+CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "120"))  # Minimum hedef coin sayısı
+CRYPTO_MAX_LEVEL = int(os.getenv("CRYPTO_MAX_LEVEL", "2"))  # Maksimum gevşeme seviyesi
 
-# Tutarlılık filtreleri (başlangıç değerleri)
-CRYPTO_MEDIAN_MIN = float(os.getenv("CRYPTO_MEDIAN_MIN", "600000"))  # Median >= $600K
-CRYPTO_DAYS_ABOVE_FLOOR = int(os.getenv("CRYPTO_DAYS_ABOVE_FLOOR", "18"))  # 30 günün en az 18'i
-CRYPTO_FLOOR_VOLUME = float(os.getenv("CRYPTO_FLOOR_VOLUME", "500000"))  # $500K floor
-CRYPTO_SPIKE_RATIO_MAX = float(os.getenv("CRYPTO_SPIKE_RATIO_MAX", "8"))  # max/median <= 8
+# CoinGecko hacim filtreleri
+CRYPTO_MIN_24H_VOLUME = float(os.getenv("CRYPTO_MIN_24H_VOLUME", "5000000"))  # Min 24h hacim $5M (Level 0)
+CRYPTO_MIN_MCAP = float(os.getenv("CRYPTO_MIN_MCAP", "50000000"))  # Min market cap $50M (Level 0)
 
 # EMA cross için minimum gap (fake cross engellemek için)
 EMA_MIN_REL_GAP = float(os.getenv("EMA_MIN_REL_GAP", "0.001"))  # %0.1 (Kripto/NASDAQ)
@@ -48,23 +45,8 @@ BIST_EMA_MIN_REL_GAP = float(os.getenv("BIST_EMA_MIN_REL_GAP", "0.0005"))  # %0.
 EQUITY_MAX_BARS_AGO = int(os.getenv("EQUITY_MAX_BARS_AGO", "2"))  # Son 2 bar
 EQUITY_MAX_DAYS_AGO = int(os.getenv("EQUITY_MAX_DAYS_AGO", "5"))  # Hafta sonu kaçırmasın
 
-def normalize_binance_base(url: str) -> str:
-    """Binance base URL'ini normalize eder (sonundaki /api/v3 veya / varsa kaldırır)."""
-    url = (url or "").strip().rstrip("/")
-    if url.endswith("/api/v3"):
-        url = url[:-7]
-    return url
-
-# Binance API base URL'leri (fallback sırasıyla denenir)
-BINANCE_API_BASES = [
-    normalize_binance_base(os.getenv("BINANCE_API_BASE", "https://data-api.binance.vision")),
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-]
-
-# Binance API rate limit bekleme süresi (saniye)
-BINANCE_RATE_LIMIT_SLEEP = float(os.getenv("BINANCE_RATE_LIMIT_SLEEP", "0.10"))
+# CoinGecko API
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 
 # Telegram mesaj karakter limiti (güvenli sınır)
 TELEGRAM_CHAR_LIMIT = 3800
@@ -75,14 +57,14 @@ CRYPTO_BLACKLIST = {
     # Stablecoinler
     "USDC", "TUSD", "FDUSD", "USDE", "USDP", "USD1", "XUSD",
     "EURI", "EUR", "BUSD", "DAI", "PAXG", "GUSD", "USDJ",
-    "USDD", "USTC", "AEUR", "PYUSD", "FRAX",
+    "USDD", "USTC", "AEUR", "PYUSD", "FRAX", "USDT", "XAUT",
     
     # Fan tokenler
     "BAR", "PSG", "SANTOS", "LAZIO", "PORTO", "ACM", "ASR",
     "CITY", "ALPINE", "OG", "JUV", "ATM", "INTER", "AFC",
     "NAV", "SPURS",
     
-    # Wrapped tokenler (orijinali zaten listede)
+    # Wrapped tokenler
     "WBTC", "WETH", "WBNB",
     
     # Dead/Ölü projeler
@@ -107,17 +89,14 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
     """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     
-    # Mesajı parçalara böl (4096 limit, güvenli sınır 3800)
     chunks = []
     if len(text) <= TELEGRAM_CHAR_LIMIT:
         chunks = [text]
     else:
-        # Satır satır böl, her parça limite sığsın
         lines = text.split("\n")
         current_chunk = ""
         
         for line in lines:
-            # Eğer bu satırı eklersek limit aşılır mı?
             if len(current_chunk) + len(line) + 1 > TELEGRAM_CHAR_LIMIT:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
@@ -125,11 +104,9 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
             else:
                 current_chunk += line + "\n"
         
-        # Son parçayı ekle
         if current_chunk.strip():
             chunks.append(current_chunk.strip())
     
-    # Her parçayı gönder
     for i, chunk in enumerate(chunks):
         if len(chunks) > 1:
             chunk = f"<b>[{i+1}/{len(chunks)}]</b>\n{chunk}"
@@ -144,7 +121,6 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
             if not r.ok:
                 print(f"Telegram hata (parça {i+1}): {r.status_code} {r.text}")
             
-            # Birden fazla parça varsa araya bekleme koy
             if len(chunks) > 1 and i < len(chunks) - 1:
                 time.sleep(0.5)
                 
@@ -155,8 +131,7 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
 
 def read_symbol_file(path: str):
     """
-    bist_all.txt / nasdaq100.txt / binance.txt gibi dosyalardan sembol listesi okur.
-    Her satır 1 sembol: boş satırlar ve # ile başlayan satırlar atlanır.
+    Sembol listesi dosyasını okur.
     """
     if not os.path.exists(path):
         print(f"UYARI: {path} bulunamadı, bu evren taranmayacak.")
@@ -174,7 +149,7 @@ def read_symbol_file(path: str):
 
 def extract_base_symbol(sym: str) -> str:
     """
-    Sembolden base kısmını güvenli şekilde çıkarır.
+    Sembolden base kısmını çıkarır.
     BTC/USDT -> BTC
     BTCUSDT -> BTC
     """
@@ -195,9 +170,7 @@ def select_most_liquid_bist_symbols(
     universe_name: str = "BIST"
 ):
     """
-    Verilen BIST sembolleri arasından, son 'lookback_days' içinde
-    ortalama işlem değeri (Close * Volume) en yüksek olan ilk 'max_count'
-    hisseyi seçer.
+    BIST sembolleri arasından en likit olanları seçer.
     """
     if not symbols:
         return []
@@ -214,7 +187,7 @@ def select_most_liquid_bist_symbols(
         )
     except Exception as e:
         print(f"{universe_name} likidite indirme hatası:", e)
-        return symbols  # fallback
+        return symbols
 
     multi = isinstance(data.columns, pd.MultiIndex)
     liquidity_list = []
@@ -249,16 +222,13 @@ def select_most_liquid_bist_symbols(
             continue
 
     if not liquidity_list:
-        print(f"{universe_name} için likidite listesi boş, fallback ile tüm semboller kullanılacak.")
+        print(f"{universe_name} için likidite listesi boş, fallback.")
         return symbols
 
     liquidity_list.sort(key=lambda x: x[1], reverse=True)
     top_syms = [sym for sym, _ in liquidity_list[:max_count]]
 
-    print(
-        f"{universe_name}: {len(symbols)} sembolden likiditeye göre "
-        f"ilk {len(top_syms)} seçildi (max_count={max_count})."
-    )
+    print(f"{universe_name}: {len(symbols)} sembolden {len(top_syms)} seçildi.")
     return top_syms
 
 
@@ -271,12 +241,7 @@ def has_recent_bullish_cross(
     min_rel_gap: float = 0.001
 ) -> bool:
     """
-    EMA fast & slow için bullish cross noktalarını bulur.
-
-    Şartlar:
-      - Cross, son bar veya en fazla max_bars_ago bar önce olacak.
-      - Cross'un tarihi bugünden en fazla max_days_ago gün önce olacak.
-      - Cross barında EMA_fast - EMA_slow, fiyata oranla en az min_rel_gap olmalı.
+    EMA bullish cross kontrolü.
     """
     if len(close) < slow + 3:
         return False
@@ -301,7 +266,7 @@ def has_recent_bullish_cross(
     if last_cross < last_idx - max_bars_ago:
         return False
 
-    # 2) Gap kontrolü (fake cross engellemek için)
+    # 2) Gap kontrolü
     if min_rel_gap > 0:
         try:
             gap = float(ema_fast.iloc[last_cross] - ema_slow.iloc[last_cross])
@@ -310,11 +275,10 @@ def has_recent_bullish_cross(
                 return False
             if gap / price < min_rel_gap:
                 return False
-        except Exception as e:
-            print("Gap kontrolü hatası (has_recent_bullish_cross):", e)
+        except Exception:
             return False
 
-    # 3) Tarih bazlı kontrol (DatetimeIndex varsa)
+    # 3) Tarih bazlı kontrol
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
         try:
@@ -325,14 +289,10 @@ def has_recent_bullish_cross(
 
             cross_ts = pd.Timestamp(last_cross_time)
             
-            # BIST/yfinance tz-naive gelir, Kripto tz-aware gelir
-            # Her ikisini de aynı şekilde karşılaştır
             if cross_ts.tz is None:
-                # tz-naive: today de tz-naive olsun
                 today_utc = pd.Timestamp.utcnow().replace(tzinfo=None).normalize()
                 cross_day = cross_ts.normalize()
             else:
-                # tz-aware: UTC'ye çevir
                 today_utc = pd.Timestamp.now(tz="UTC").normalize()
                 cross_ts = cross_ts.tz_convert("UTC")
                 cross_day = cross_ts.normalize()
@@ -341,9 +301,7 @@ def has_recent_bullish_cross(
 
             if days_diff > max_days_ago:
                 return False
-        except Exception as e:
-            print("Tarih kontrolü hatası (has_recent_bullish_cross):", e)
-            # Tarih kontrolü başarısız olursa, bar bazlı kontrole güven
+        except Exception:
             pass
 
     return True
@@ -359,14 +317,11 @@ def summarize_errors(errors, max_show: int = 10) -> str:
     return f"<i>(Veri hatası: {total} sembol, ilk {max_show}: {shown})</i>"
 
 
-# =============== Hisse Taraması (BIST & NASDAQ, toplu yfinance) ===============
+# =============== Hisse Taraması (BIST & NASDAQ) ===============
 
 def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
     """
-    yfinance ile TÜM sembolleri toplu indirip,
-    EMA 13-34 için son 1 mum (max 2 mum) bullish cross arar.
-    
-    min_gap: EMA gap kontrolü (None ise EMA_MIN_REL_GAP kullanılır)
+    yfinance ile hisse taraması yapar.
     """
     if min_gap is None:
         min_gap = EMA_MIN_REL_GAP
@@ -425,378 +380,162 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
     return result
 
 
-# =============== Kripto: Binance Hacim + Tutarlılık + MEXC Mum Verisi ===============
+# =============== CoinGecko Hacim Verisi ===============
 
-CRYPTO_TIMEFRAME = "1d"
-CRYPTO_OHLC_LIMIT = 220  # EMA için yeterli mum sayısı
-
-
-def binance_api_request(endpoint: str, params: dict = None, timeout: int = 15):
+def get_coingecko_market_data() -> dict:
     """
-    Binance API'ye istek atar.
-    - 429'da aynı base üzerinde exponential backoff ile retry
-    - 451/403/5xx'de sonraki base'e geç
+    CoinGecko'dan top coinlerin market verisini çeker.
+    Tek çağrıda 250 coin, 2 çağrıda 500 coin.
+    
+    Returns: {symbol: {volume_24h, market_cap, price}, ...}
     """
-    if params is None:
-        params = {}
+    market_data = {}
     
-    per_base_retries = 3
-    backoff = 2
-    
-    for base in BINANCE_API_BASES:
-        url = f"{base}{endpoint}"
-        
-        for attempt in range(per_base_retries):
-            try:
-                r = requests.get(url, params=params, timeout=timeout)
-                
-                if r.status_code == 200:
-                    try:
-                        return r.json()
-                    except Exception:
-                        return None
-                
-                # 429: aynı base üzerinde bekle + retry
-                if r.status_code == 429:
-                    wait = backoff * (2 ** attempt)  # Exponential: 2, 4, 8
-                    print(f"[Binance] 429 Rate limit ({base}) → {wait}s bekle (attempt {attempt+1}/{per_base_retries})")
-                    time.sleep(wait)
-                    continue
-                
-                # 451/403/418 veya 5xx: base değiştir
-                if r.status_code in (451, 418, 403) or (500 <= r.status_code < 600):
-                    print(f"[Binance] HTTP {r.status_code} ({base}) → sonraki base")
-                    break
-                
-                # Diğer hatalar: base değiştir
-                print(f"[Binance] HTTP {r.status_code} ({base}) → sonraki base")
-                break
-                
-            except Exception as e:
-                print(f"[Binance] exception ({base}) → {e}")
-                break
-    
-    print("Tüm Binance base'leri başarısız!")
-    return None
-
-
-def get_binance_24h_volumes() -> dict:
-    """
-    Binance ticker/24hr endpoint'inden TÜM coinlerin 24h hacmini tek çağrıyla çeker.
-    Returns: {symbol: quote_volume, ...}  örn: {"BTCUSDT": 1234567890.5, ...}
-    """
-    data = binance_api_request("/api/v3/ticker/24hr")
-    if not data:
-        return {}
-    
-    volumes = {}
-    for ticker in data:
+    for page in [1, 2]:  # İlk 500 coin
         try:
-            symbol = ticker.get("symbol", "")
-            if symbol.endswith("USDT"):
-                quote_vol_str = ticker.get("quoteVolume", "0")
-                quote_vol = float(quote_vol_str) if quote_vol_str else 0
-                if quote_vol > 0:
-                    volumes[symbol] = quote_vol
-        except (ValueError, TypeError) as e:
-            # Parse hatası olursa bu coini atla
-            continue
-    
-    return volumes
-
-
-def get_binance_klines(symbol: str, limit: int = 30) -> list:
-    """
-    Tek bir sembol için klines çeker (fallback destekli).
-    """
-    params = {"symbol": symbol, "interval": "1d", "limit": limit}
-    return binance_api_request("/api/v3/klines", params)
-
-
-def get_binance_30d_volume_stats(symbols: list) -> dict:
-    """
-    Optimize edilmiş hacim istatistikleri:
-    1. Önce ticker/24hr ile tüm coinlerin anlık hacmini çek (tek istek)
-    2. Sembolleri 24h hacme göre ön-filtrele
-    3. Sadece filtrelenmiş coinler için 30 günlük klines çek
-    
-    Returns: {symbol: {avg, median, max, days_above, spike_ratio}, ...}
-    """
-    stats = {}
-    
-    # 1. Önce 24h hacimlerini tek çağrıyla al
-    print("Binance'ten 24h hacim verisi çekiliyor (tek çağrı)...")
-    all_24h_volumes = get_binance_24h_volumes()
-    
-    if not all_24h_volumes:
-        print("24h hacim verisi alınamadı, doğrudan klines çekilecek...")
-        # Fallback: eski yöntemle devam et
-        return get_binance_30d_volume_stats_direct(symbols)
-    
-    print(f"24h hacim verisi alındı: {len(all_24h_volumes)} USDT çifti")
-    
-    # 2. Sembolleri 24h hacme göre filtrele ve sırala
-    symbol_volumes = []
-    for sym in symbols:
-        binance_symbol = sym.replace("/", "")
-        vol_24h = all_24h_volumes.get(binance_symbol, 0)
-        if vol_24h > 0:
-            symbol_volumes.append((sym, binance_symbol, vol_24h))
-    
-    # 24h hacme göre sırala (büyükten küçüğe)
-    symbol_volumes.sort(key=lambda x: x[2], reverse=True)
-    
-    # İlk TopK + buffer kadarını al (gereksiz klines çağrısı yapmamak için)
-    top_symbols = symbol_volumes[:CRYPTO_TOP_K + 150]  # Buffer artırıldı - gevşetmeye daha az ihtiyaç
-    print(f"24h hacme göre ilk {len(top_symbols)} coin seçildi, klines çekiliyor...")
-    
-    # 3. Sadece seçilen coinler için 30 günlük klines çek
-    for sym, binance_symbol, vol_24h in top_symbols:
-        try:
-            klines = get_binance_klines(binance_symbol, 30)
+            url = f"{COINGECKO_API_URL}/coins/markets"
+            params = {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 250,
+                "page": page,
+                "sparkline": "false"
+            }
             
-            if klines and len(klines) >= 7:
-                # Parse guard ile daily volumes çek
-                daily_volumes = []
-                for k in klines:
-                    try:
-                        daily_volumes.append(float(k[7]))
-                    except (ValueError, TypeError, IndexError):
-                        continue
-                
-                if len(daily_volumes) < 7:
-                    time.sleep(BINANCE_RATE_LIMIT_SLEEP)
-                    continue
-                
-                avg_vol = sum(daily_volumes) / len(daily_volumes)
-                sorted_vols = sorted(daily_volumes)
-                n = len(sorted_vols)
-                if n % 2 == 0:
-                    median_vol = (sorted_vols[n // 2 - 1] + sorted_vols[n // 2]) / 2
-                else:
-                    median_vol = sorted_vols[n // 2]
-                max_vol = max(daily_volumes)
-                days_above = sum(1 for v in daily_volumes if v >= CRYPTO_FLOOR_VOLUME)
-                spike_ratio = max_vol / median_vol if median_vol > 0 else 999
-                
-                stats[sym] = {
-                    "avg": avg_vol,
-                    "median": median_vol,
-                    "max": max_vol,
-                    "days_above": days_above,
-                    "spike_ratio": spike_ratio
-                }
+            r = requests.get(url, params=params, timeout=30)
             
-            time.sleep(BINANCE_RATE_LIMIT_SLEEP)
+            if r.status_code == 200:
+                data = r.json()
+                for coin in data:
+                    symbol = coin.get("symbol", "").upper()
+                    if symbol:
+                        market_data[symbol] = {
+                            "volume_24h": coin.get("total_volume", 0) or 0,
+                            "market_cap": coin.get("market_cap", 0) or 0,
+                            "price": coin.get("current_price", 0) or 0,
+                            "name": coin.get("name", ""),
+                            "id": coin.get("id", "")
+                        }
+                print(f"CoinGecko sayfa {page}: {len(data)} coin alındı")
+            else:
+                print(f"CoinGecko hata (sayfa {page}): HTTP {r.status_code}")
             
+            # Rate limit için bekle
+            if page < 2:
+                time.sleep(1.5)
+                
         except Exception as e:
-            print(f"Klines hatası {sym}: {e}")
-            continue
+            print(f"CoinGecko exception (sayfa {page}): {e}")
     
-    return stats
+    print(f"CoinGecko toplam: {len(market_data)} coin")
+    return market_data
 
 
-def get_binance_30d_volume_stats_direct(symbols: list) -> dict:
+def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     """
-    Fallback: Doğrudan her sembol için klines çeker (eski yöntem).
-    ticker/24hr çalışmazsa kullanılır.
-    """
-    stats = {}
+    CoinGecko hacim verisiyle kripto filtreleme.
     
-    for sym in symbols:
-        binance_symbol = sym.replace("/", "")
-        
-        try:
-            klines = get_binance_klines(binance_symbol, 30)
-            
-            if klines and len(klines) >= 7:
-                # Parse guard ile daily volumes çek
-                daily_volumes = []
-                for k in klines:
-                    try:
-                        daily_volumes.append(float(k[7]))
-                    except (ValueError, TypeError, IndexError):
-                        continue
-                
-                if len(daily_volumes) < 7:
-                    time.sleep(BINANCE_RATE_LIMIT_SLEEP)
-                    continue
-                
-                avg_vol = sum(daily_volumes) / len(daily_volumes)
-                sorted_vols = sorted(daily_volumes)
-                n = len(sorted_vols)
-                if n % 2 == 0:
-                    median_vol = (sorted_vols[n // 2 - 1] + sorted_vols[n // 2]) / 2
-                else:
-                    median_vol = sorted_vols[n // 2]
-                max_vol = max(daily_volumes)
-                days_above = sum(1 for v in daily_volumes if v >= CRYPTO_FLOOR_VOLUME)
-                spike_ratio = max_vol / median_vol if median_vol > 0 else 999
-                
-                stats[sym] = {
-                    "avg": avg_vol,
-                    "median": median_vol,
-                    "max": max_vol,
-                    "days_above": days_above,
-                    "spike_ratio": spike_ratio
-                }
-                
-            time.sleep(BINANCE_RATE_LIMIT_SLEEP)
-            
-        except Exception as e:
-            print(f"Binance hacim çekme hatası {sym}: {e}")
-            continue
-    
-    return stats
-
-
-def apply_consistency_filter(
-    top_k_symbols: list,
-    median_min: float,
-    days_above_min: int,
-    spike_max: float
-) -> tuple:
+    Returns: (filtered_list, used_level, stats)
     """
-    Tutarlılık filtresini uygular ve geçen sembolleri döndürür.
-    """
-    final_list = []
-    filtered_out = {"median": 0, "days_above": 0, "spike_ratio": 0}
-    
-    for sym, stat in top_k_symbols:
-        # Median kontrolü
-        if stat["median"] < median_min:
-            filtered_out["median"] += 1
-            continue
-        
-        # Days above floor kontrolü
-        if stat["days_above"] < days_above_min:
-            filtered_out["days_above"] += 1
-            continue
-        
-        # Spike ratio kontrolü
-        if stat["spike_ratio"] > spike_max:
-            filtered_out["spike_ratio"] += 1
-            continue
-        
-        final_list.append(sym)
-    
-    return final_list, filtered_out
-
-
-def filter_crypto_symbols(symbols: list) -> tuple:
-    """
-    Kripto filtreleme pipeline:
-    1. Blacklist'teki sembolleri çıkar
-    2. Binance'ten 30 günlük hacim istatistikleri çek
-    3. TopK en likit olanı seç
-    4. Tutarlılık filtresi uygula (median, days_above, spike_ratio)
-    5. 200+ garanti için otomatik gevşetme
-    
-    Returns: (final_list, used_level, final_count)
-    """
-    # 1. Blacklist filtresi (güvenli base çıkarma)
+    # 1. Blacklist filtresi
     after_blacklist = []
     for sym in symbols:
         base = extract_base_symbol(sym)
         if base not in CRYPTO_BLACKLIST:
-            after_blacklist.append(sym)
-        else:
-            print(f"Blacklist'te: {sym}")
+            after_blacklist.append((sym, base))
     
     print(f"Blacklist sonrası: {len(symbols)} -> {len(after_blacklist)} sembol")
     
     if not after_blacklist:
-        return [], 0, 0
+        return [], 0, {}
     
-    # 2. Binance'ten hacim istatistikleri çek (optimize edilmiş)
-    print(f"Binance'ten hacim istatistikleri çekiliyor ({len(after_blacklist)} sembol)...")
-    volume_stats = get_binance_30d_volume_stats(after_blacklist)
+    # 2. CoinGecko verisiyle eşleştir
+    matched = []
+    not_found = []
     
-    if not volume_stats:
-        print("Hacim verisi alınamadı!")
-        return [], 0, 0
+    for sym, base in after_blacklist:
+        if base in market_data:
+            data = market_data[base]
+            matched.append({
+                "symbol": sym,
+                "base": base,
+                "volume_24h": data["volume_24h"],
+                "market_cap": data["market_cap"]
+            })
+        else:
+            not_found.append(base)
     
-    print(f"Hacim verisi alınan: {len(volume_stats)} sembol")
+    print(f"CoinGecko eşleşen: {len(matched)}, bulunamayan: {len(not_found)}")
+    if not_found[:10]:
+        print(f"Bulunamayan örnekler: {not_found[:10]}")
     
-    # 3. Median hacme göre sırala ve TopK seç
-    sorted_by_median = sorted(
-        volume_stats.items(),
-        key=lambda x: x[1]["median"],
-        reverse=True
-    )
+    if not matched:
+        return [], 0, {"matched": 0, "not_found": len(not_found)}
     
-    top_k_symbols = sorted_by_median[:CRYPTO_TOP_K]
-    print(f"TopK ({CRYPTO_TOP_K}) seçildi: {len(top_k_symbols)} sembol")
+    # 3. Hacme göre sırala
+    matched.sort(key=lambda x: x["volume_24h"], reverse=True)
     
-    # 4. Tutarlılık filtresi + 200+ garanti için otomatik gevşetme
-    # Gevşetme seviyeleri (sırasıyla denenecek)
+    # 4. Gevşetme seviyeleri ile filtrele
     relaxation_levels = [
-        # Level 0: Orijinal değerler
-        {"median_min": CRYPTO_MEDIAN_MIN, "days_above_min": CRYPTO_DAYS_ABOVE_FLOOR, "spike_max": CRYPTO_SPIKE_RATIO_MAX, "label": "Sıkı"},
-        # Level 1: days_above gevşet
-        {"median_min": CRYPTO_MEDIAN_MIN, "days_above_min": 16, "spike_max": CRYPTO_SPIKE_RATIO_MAX, "label": "Normal"},
-        # Level 2: median gevşet
-        {"median_min": 500000, "days_above_min": 16, "spike_max": CRYPTO_SPIKE_RATIO_MAX, "label": "Gevşek"},
-        # Level 3: spike gevşet
-        {"median_min": 500000, "days_above_min": 16, "spike_max": 10, "label": "Çok Gevşek"},
-        # Level 4: daha da gevşet
-        {"median_min": 400000, "days_above_min": 14, "spike_max": 12, "label": "Minimum"},
+        # Level 0: Sıkı
+        {"min_volume": 5000000, "min_mcap": 50000000, "label": "Sıkı"},
+        # Level 1: Normal
+        {"min_volume": 2000000, "min_mcap": 20000000, "label": "Normal"},
+        # Level 2: Gevşek
+        {"min_volume": 1000000, "min_mcap": 10000000, "label": "Gevşek"},
     ]
     
     final_list = []
     used_level = 0
-    filtered_out = {}
     
     for level_idx, params in enumerate(relaxation_levels):
-        # Maksimum gevşeme seviyesini aşma
         if level_idx > CRYPTO_MAX_LEVEL:
-            print(f"Maksimum gevşeme seviyesine ({CRYPTO_MAX_LEVEL}) ulaşıldı, daha fazla gevşetme yapılmayacak.")
+            print(f"Maksimum gevşeme seviyesine ({CRYPTO_MAX_LEVEL}) ulaşıldı.")
             break
         
-        final_list, filtered_out = apply_consistency_filter(
-            top_k_symbols,
-            params["median_min"],
-            params["days_above_min"],
-            params["spike_max"]
-        )
+        filtered = []
+        for coin in matched:
+            if coin["volume_24h"] >= params["min_volume"] and coin["market_cap"] >= params["min_mcap"]:
+                filtered.append(coin["symbol"])
         
-        if len(final_list) >= CRYPTO_MIN_TARGET:
+        if len(filtered) >= CRYPTO_MIN_TARGET:
+            final_list = filtered
             used_level = level_idx
             break
         else:
-            print(f"Level {level_idx} ({params['label']}): {len(final_list)} sembol (hedef: {CRYPTO_MIN_TARGET}), gevşetiliyor...")
+            print(f"Level {level_idx} ({params['label']}): {len(filtered)} sembol (hedef: {CRYPTO_MIN_TARGET}), gevşetiliyor...")
+            final_list = filtered
             used_level = level_idx
     
     level_label = relaxation_levels[used_level]["label"]
+    print(f"Kripto filtre: Level {used_level} ({level_label}), geçen: {len(final_list)} sembol")
     
-    print(f"\n=== Tutarlılık Filtresi Sonucu ===")
-    print(f"Kullanılan filtre seviyesi: Level {used_level} ({level_label})")
-    print(f"TopK'dan geçen: {len(final_list)} sembol")
-    print(f"Elenenler -> Median düşük: {filtered_out['median']}, "
-          f"Tutarsız: {filtered_out['days_above']}, "
-          f"Spike: {filtered_out['spike_ratio']}")
+    stats = {
+        "matched": len(matched),
+        "not_found": len(not_found),
+        "filtered": len(final_list)
+    }
     
-    if len(final_list) < CRYPTO_MIN_TARGET:
-        print(f"UYARI: Hedef ({CRYPTO_MIN_TARGET}) karşılanamadı, {len(final_list)} sembolle devam ediliyor.")
-    
-    return final_list, used_level, len(final_list)
+    return final_list, used_level, stats
 
 
-def find_mexc_symbol(binance_symbol: str, markets: dict):
+# =============== Kripto Tarama (MEXC) ===============
+
+CRYPTO_TIMEFRAME = "1d"
+CRYPTO_OHLC_LIMIT = 220
+
+
+def find_mexc_symbol(base_symbol: str, markets: dict):
     """
-    Binance tarzı sembolü (BTC/USDT veya BTCUSDT) alır,
-    MEXC'te olası market adını tahmin eder.
+    Base sembolü MEXC market adına çevirir.
     """
-    s = binance_symbol.strip().upper()
-    if not s:
+    base = extract_base_symbol(base_symbol).upper()
+    if not base:
         return None
 
-    base = extract_base_symbol(s)
-    quote = "USDT"
-
     candidates = [
-        f"{base}/{quote}",
-        f"{base}/{quote}:USDT",
+        f"{base}/USDT",
+        f"{base}/USDT:USDT",
     ]
 
     for c in candidates:
@@ -809,18 +548,12 @@ def find_mexc_symbol(binance_symbol: str, markets: dict):
 def remove_incomplete_candle(df: pd.DataFrame) -> pd.DataFrame:
     """
     Bugünkü tamamlanmamış mumu kaldırır.
-    1D timeframe'de son bar bugünse atılır.
-    Tüm karşılaştırmalar UTC tz-aware yapılır.
     """
     if df.empty:
         return df
     
     last_ts = df["timestamp"].iloc[-1]
-    
-    # ccxt: ms int -> UTC tz-aware midnight
     last_date = pd.Timestamp(int(last_ts), unit="ms", tz="UTC").normalize()
-    
-    # UTC tz-aware today midnight
     today = pd.Timestamp.now(tz="UTC").normalize()
     
     if last_date >= today:
@@ -829,13 +562,14 @@ def remove_incomplete_candle(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def scan_crypto_from_mexc_list() -> tuple:
+def scan_crypto_from_list() -> tuple:
     """
-    1. binance.txt'den sembolleri oku
-    2. Blacklist + TopK + Tutarlılık filtresi uygula
-    3. MEXC 1D OHLCV'den EMA 13-34 bullish cross tara
-    4. Bugünkü yarım mumu atarak fake sinyalleri azalt
-    5. Timestamp index kullanarak tarih kontrolü çalışsın
+    Kripto tarama:
+    1. midas.txt'den sembolleri oku
+    2. CoinGecko'dan hacim verisi çek
+    3. Hacim filtresi uygula
+    4. MEXC'ten mum verisi çek
+    5. EMA 13-34 tara
     
     Returns: (result_dict, filter_level, scanned_count)
     """
@@ -844,9 +578,10 @@ def scan_crypto_from_mexc_list() -> tuple:
         "errors": []
     }
 
-    symbols = read_symbol_file(BINANCE_LIST_FILE)
+    # 1. Sembol listesini oku
+    symbols = read_symbol_file(CRYPTO_LIST_FILE)
     if not symbols:
-        print(f"{BINANCE_LIST_FILE} boş veya bulunamadı.")
+        print(f"{CRYPTO_LIST_FILE} boş veya bulunamadı.")
         return result, 0, 0
 
     print(f"\n{'='*50}")
@@ -854,8 +589,16 @@ def scan_crypto_from_mexc_list() -> tuple:
     print(f"{'='*50}")
     print(f"Toplam sembol: {len(symbols)}")
     
-    # Blacklist + TopK + Tutarlılık filtresi
-    filtered_symbols, filter_level, filter_count = filter_crypto_symbols(symbols)
+    # 2. CoinGecko'dan hacim verisi çek
+    print("\nCoinGecko'dan hacim verisi çekiliyor...")
+    market_data = get_coingecko_market_data()
+    
+    if not market_data:
+        print("CoinGecko verisi alınamadı!")
+        return result, 0, 0
+    
+    # 3. Hacim filtresi uygula
+    filtered_symbols, filter_level, stats = filter_crypto_by_coingecko(symbols, market_data)
     
     if not filtered_symbols:
         print("Filtre sonrası sembol kalmadı!")
@@ -863,7 +606,7 @@ def scan_crypto_from_mexc_list() -> tuple:
     
     print(f"\nMEXC'ten mum verisi çekiliyor ({len(filtered_symbols)} sembol)...")
 
-    # MEXC bağlantısı
+    # 4. MEXC bağlantısı
     try:
         exchange = ccxt.mexc({
             "enableRateLimit": True,
@@ -875,6 +618,7 @@ def scan_crypto_from_mexc_list() -> tuple:
         result["errors"].append(msg)
         return result, filter_level, 0
 
+    # 5. Her coin için OHLCV çek ve EMA tara
     processed_count = 0
     mexc_not_found = 0
 
@@ -883,11 +627,12 @@ def scan_crypto_from_mexc_list() -> tuple:
         if not raw_sym:
             continue
 
+        base = extract_base_symbol(raw_sym)
         mexc_symbol = find_mexc_symbol(raw_sym, markets)
+        
         if mexc_symbol is None:
-            print(f"{raw_sym}: MEXC'te market bulunamadı")
             mexc_not_found += 1
-            result["errors"].append(raw_sym)
+            result["errors"].append(base)
             continue
 
         try:
@@ -897,13 +642,12 @@ def scan_crypto_from_mexc_list() -> tuple:
                 limit=CRYPTO_OHLC_LIMIT,
             )
         except Exception as e:
-            print(f"MEXC veri hatası {raw_sym}: {e}")
-            result["errors"].append(raw_sym)
+            print(f"MEXC veri hatası {base}: {e}")
+            result["errors"].append(base)
             continue
 
         if not ohlcv or len(ohlcv) < 60:
-            print(f"{raw_sym}: yetersiz OHLCV verisi")
-            result["errors"].append(raw_sym)
+            result["errors"].append(base)
             continue
 
         df = pd.DataFrame(
@@ -911,22 +655,17 @@ def scan_crypto_from_mexc_list() -> tuple:
             columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
         
-        # KRITIK: Bugünkü tamamlanmamış mumu at
         df = remove_incomplete_candle(df)
         
         if len(df) < 60:
-            print(f"{raw_sym}: yarım mum atıldıktan sonra yetersiz veri")
-            result["errors"].append(raw_sym)
+            result["errors"].append(base)
             continue
         
-        # Timestamp'i DatetimeIndex'e çevir (tarih kontrolü çalışsın - UTC tz-aware)
         df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         close = pd.Series(df["close"].astype(float).values, index=df["dt"])
 
-        display_name = extract_base_symbol(raw_sym)
-
         if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP):
-            result["13_34_bull"].append(display_name)
+            result["13_34_bull"].append(base)
 
         processed_count += 1
 
@@ -946,15 +685,12 @@ def scan_crypto_from_mexc_list() -> tuple:
 def format_result_block(title: str, res: dict) -> str:
     """
     Sonuçları HTML formatında formatlar.
-    Coin listesi <code> bloğunda monospace gösterilir.
-    Uzun listeler 25 coin/satır olarak bölünür.
     """
     lines = [f"<b>📌 {escape_html(title)}</b>"]
 
     def format_coin_list(lst, per_line=25):
         if not lst:
             return "<i>-</i>"
-        # Coin listesini satırlara böl (Telegram 4096 limit için)
         result_lines = []
         for i in range(0, len(lst), per_line):
             result_lines.append(", ".join(lst[i:i+per_line]))
@@ -979,8 +715,6 @@ def get_filter_level_label(level: int) -> str:
         0: "Sıkı 🔒",
         1: "Normal ✅",
         2: "Gevşek ⚡",
-        3: "Çok Gevşek ⚠️",
-        4: "Minimum 🔓"
     }
     return labels.get(level, f"Level {level}")
 
@@ -1017,17 +751,17 @@ def main():
         nasdaq_res = scan_equity_universe(nasdaq_symbols, "NASDAQ 100", min_gap=EMA_MIN_REL_GAP)
         nasdaq_text = format_result_block("🇺🇸 NASDAQ 100", nasdaq_res)
 
-    # --- Kripto (TopK + Tutarlılık filtresi + MEXC mum verisi) --- #
-    crypto_res, crypto_filter_level, crypto_scanned = scan_crypto_from_mexc_list()
+    # --- Kripto (CoinGecko hacim + MEXC mum) --- #
+    crypto_res, crypto_filter_level, crypto_scanned = scan_crypto_from_list()
     filter_label = get_filter_level_label(crypto_filter_level)
     crypto_text = format_result_block(f"🪙 Kripto ({crypto_scanned} coin tarandı)", crypto_res)
 
-    # --- Telegram'a gönder (header + sonuçlar) --- #
+    # --- Telegram'a gönder --- #
     header = (
         f"<b>📊 EMA 13-34 Yükseliş Kesişim Tarama</b>\n"
         f"<b>Tarih:</b> {today_str}\n"
         f"<b>Timeframe:</b> 1D\n"
-        f"<b>Evren:</b> {BIST_LABEL}, NASDAQ 100, Kripto Top {CRYPTO_TOP_K}\n"
+        f"<b>Evren:</b> {BIST_LABEL}, NASDAQ 100, Midas Kripto\n"
         f"<b>Kripto Filtre:</b> {filter_label} (Level {crypto_filter_level})\n"
         f"<i>NOT: Sadece son 1-2 mumda oluşmuş bullish kesişimler.</i>"
     )
