@@ -30,7 +30,8 @@ BIST_LABEL = os.getenv("BIST_LABEL", f"BIST Top {BIST_MAX_COUNT} Likit")
 CRYPTO_LIST_FILE = os.getenv("CRYPTO_LIST_FILE", "midas.txt")
 
 # ---- Kripto Filtreleme Parametreleri ----
-CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "120"))  # Minimum hedef coin sayısı
+CRYPTO_MIN_TARGET = int(os.getenv("CRYPTO_MIN_TARGET", "80"))  # Minimum hedef coin sayısı
+CRYPTO_MAX_COINS = int(os.getenv("CRYPTO_MAX_COINS", "100"))  # Maximum taranacak coin sayısı
 CRYPTO_MAX_LEVEL = int(os.getenv("CRYPTO_MAX_LEVEL", "2"))  # Maksimum gevşeme seviyesi
 
 # CoinGecko hacim filtreleri
@@ -509,6 +510,11 @@ def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     
     level_label = relaxation_levels[used_level]["label"]
     print(f"Kripto filtre: Level {used_level} ({level_label}), geçen: {len(final_list)} sembol")
+    
+    # Maximum coin sayısına kırp (en hacimli olanlar zaten başta)
+    if len(final_list) > CRYPTO_MAX_COINS:
+        print(f"Max {CRYPTO_MAX_COINS} coin'e kırpılıyor ({len(final_list)} -> {CRYPTO_MAX_COINS})")
+        final_list = final_list[:CRYPTO_MAX_COINS]
     
     stats = {
         "matched": len(matched),
