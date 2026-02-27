@@ -182,7 +182,7 @@ def select_most_liquid_bist_symbols(
             period=f"{lookback_days}d",
             interval=TIMEFRAME_DAYS,
             group_by="ticker",
-            auto_adjust=False,
+            auto_adjust=True,
             progress=False,
             threads=True,
         )
@@ -264,18 +264,19 @@ def has_recent_bullish_cross(
     last_idx = len(close) - 1
 
     # 1) Bar bazlı kontrol
-    if last_cross < last_idx - max_bars_ago:
+    bars_ago = last_idx - last_cross
+    if bars_ago > max_bars_ago:
         return False
 
     # 2) Gap kontrolü — son bardaki gap'e bakıyoruz (cross barında gap çok küçük olabilir)
-    # FIX: eskiden cross barında bakıyordu, sinyal kaçırmaya yol açıyordu
     if min_rel_gap > 0:
         try:
             gap = float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
             price = float(close.iloc[-1])
             if price <= 0 or gap <= 0:
                 return False
-            if gap / price < min_rel_gap:
+            rel_gap = gap / price
+            if rel_gap < min_rel_gap:
                 return False
         except Exception:
             return False
@@ -367,7 +368,7 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
             period="400d",
             interval=TIMEFRAME_DAYS,
             group_by="ticker",
-            auto_adjust=False,
+            auto_adjust=True,
             progress=False,
             threads=True,
         )
