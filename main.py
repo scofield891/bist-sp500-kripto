@@ -267,11 +267,12 @@ def has_recent_bullish_cross(
     if last_cross < last_idx - max_bars_ago:
         return False
 
-    # 2) Gap kontrolü
+    # 2) Gap kontrolü — son bardaki gap'e bakıyoruz (cross barında gap çok küçük olabilir)
+    # FIX: eskiden cross barında bakıyordu, sinyal kaçırmaya yol açıyordu
     if min_rel_gap > 0:
         try:
-            gap = float(ema_fast.iloc[last_cross] - ema_slow.iloc[last_cross])
-            price = float(close.iloc[last_cross])
+            gap = float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
+            price = float(close.iloc[-1])
             if price <= 0 or gap <= 0:
                 return False
             if gap / price < min_rel_gap:
@@ -320,6 +321,26 @@ def summarize_errors(errors, max_show: int = 10) -> str:
 
 # =============== Hisse Taraması (BIST & NASDAQ) ===============
 
+def remove_incomplete_candle_equity(close: pd.Series) -> pd.Series:
+    """
+    FIX: yfinance bugünün yarım mumunu da veriyor.
+    Piyasa açıkken çalışırsa sahte EMA kesişimine yol açar.
+    Son bar bugüne aitse onu kaldırıyoruz.
+    """
+    if close.empty:
+        return close
+    try:
+        today = pd.Timestamp.now(tz="UTC").normalize()
+        if close.index.tz is None:
+            today_naive = today.tz_localize(None)
+            close = close[close.index.normalize() < today_naive]
+        else:
+            close = close[close.index.tz_convert("UTC").normalize() < today]
+    except Exception:
+        pass
+    return close
+
+
 def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
     """
     yfinance ile hisse taraması yapar.
@@ -335,9 +356,14 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
     if not symbols:
         return result
 
+    # FIX: Tek sembol olsa bile yfinance'den MultiIndex almak için
+    # 2+ sembol gönderiyoruz. Tek sembol flat columns döndürür,
+    # bu durumda yanlış veriye bakılır.
+    download_symbols = symbols if len(symbols) > 1 else symbols * 2
+
     try:
         data = yf.download(
-            symbols,
+            download_symbols,
             period="400d",
             interval=TIMEFRAME_DAYS,
             group_by="ticker",
@@ -360,6 +386,8 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
                     continue
                 df_sym = data[sym].dropna()
             else:
+                # Bu noktaya artık ulaşılmamalı (yukarıdaki trick sayesinde)
+                # Güvenlik için bırakıldı
                 df_sym = data
 
             if "Close" not in df_sym.columns:
@@ -368,6 +396,13 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
 
             close = df_sym["Close"].dropna()
             if close.empty:
+                result["errors"].append(sym)
+                continue
+
+            # FIX: Bugünün tamamlanmamış mumunu kaldır
+            close = remove_incomplete_candle_equity(close)
+
+            if close.empty or len(close) < 40:
                 result["errors"].append(sym)
                 continue
 
@@ -410,9 +445,16 @@ def get_coingecko_market_data() -> dict:
                 for coin in data:
                     symbol = coin.get("symbol", "").upper()
                     if symbol:
+                        # FIX: Aynı sembol varsa market cap büyük olanı tut
+                        # (BNX, HOT gibi çakışan semboller için)
+                        new_mcap = coin.get("market_cap", 0) or 0
+                        if symbol in market_data:
+                            existing_mcap = market_data[symbol]["market_cap"]
+                            if new_mcap <= existing_mcap:
+                                continue
                         market_data[symbol] = {
                             "volume_24h": coin.get("total_volume", 0) or 0,
-                            "market_cap": coin.get("market_cap", 0) or 0,
+                            "market_cap": new_mcap,
                             "price": coin.get("current_price", 0) or 0,
                             "name": coin.get("name", ""),
                             "id": coin.get("id", "")
