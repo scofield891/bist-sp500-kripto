@@ -281,6 +281,18 @@ def has_recent_bullish_cross(
         except Exception:
             return False
 
+    # 3) Sanity check: Fiyat EMA'dan çok uzaksa veri adjust sorunu var, skip et
+    # (yfinance BIST split/bedelsiz'i düzgün adjust etmeyince EMA çok düşük kalıyor)
+    try:
+        price = float(close.iloc[-1])
+        ema_f = float(ema_fast.iloc[-1])
+        if price > 0 and ema_f > 0:
+            price_vs_ema = abs(price - ema_f) / ema_f
+            if price_vs_ema > 0.15:  # Fiyat EMA13'ten %15+ uzaksa sahte cross
+                return False
+    except Exception:
+        pass
+
     # 3) Tarih bazlı kontrol
     idx = close.index
     if isinstance(idx, (pd.DatetimeIndex, pd.PeriodIndex)):
