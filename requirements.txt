@@ -3,6 +3,7 @@ numpy>=1.26.0
 pandas>=2.2.0
 python-telegram-bot>=21.0.0
 pytz>=2024.1
-python-dotenv>=1.0.0  # .env için
+python-dotenv>=1.0.0
 requests
 yfinance
+lighter-client
