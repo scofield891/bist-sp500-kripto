@@ -118,8 +118,9 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         payload = {
             "chat_id": CHAT_ID,
             "text": chunk,
-            "parse_mode": parse_mode
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         try:
             r = requests.post(url, json=payload, timeout=20)
             if not r.ok:
@@ -706,79 +707,70 @@ def fetch_tce_scores() -> dict:
 
 def format_tce_message(data: dict) -> str:
     """
-    TCE skorlarını Telegram HTML mesajı olarak formatlar.
+    TCE skorlarını Telegram mesajı olarak formatlar.
+    Spec: kısa, tekrarsız, karar odaklı.
     """
-    lines = [
-        "<b>📊 TCE Piyasa Filtresi</b>",
-        ""
-    ]
+    lines = ["📊 TCE Piyasa Filtresi", ""]
+
+    # Karar → emoji + etiket + not mapping
+    KARAR_MAP = {
+        "UZAK DUR":      {"emoji": "⛔", "label": "Uzak Dur",              "not": "Yeni alım yok"},
+        "IZLE":          {"emoji": "👀", "label": "İzle",                  "not": "Şimdilik sadece izle"},
+        "DENEME ALIMI":  {"emoji": "🟡", "label": "Deneme Alımı (%25)",   "not": "Küçük boyut denenebilir"},
+        "KADEMELI ALIM": {"emoji": "🟠", "label": "Kademeli Alım (%50)",  "not": "Parça parça giriş uygun"},
+        "NORMAL ALIM":   {"emoji": "🟢", "label": "Normal Alım (%100)",   "not": "Normal boyutla alım uygun"},
+        "VERI EKSIK":    {"emoji": "⚠️", "label": "Veri Eksik",           "not": "Skor güvenilmez"},
+    }
+
+    # Teknik faz → kısa etiket
+    PHASE_MAP = {
+        "GUCLU": "Güçlü",
+        "TOPARLANIYOR": "Toparlanıyor",
+        "ZAYIF": "Zayıf",
+    }
 
     markets = [
         ("₿", "Kripto", data.get("crypto", {})),
         ("🇹🇷", "BIST", data.get("bist", {})),
-        ("🇺🇸", "S&amp;P 500", data.get("sp500", {})),
+        ("🇺🇸", "S&P 500", data.get("sp500", {})),
     ]
+
+    last_conf_label = "?"
 
     for icon, name, md in markets:
         if not md:
-            lines.append(f"{icon} <b>{name}:</b> <i>Veri yok</i>")
+            lines.append(f"{icon} {name}: Veri yok")
+            lines.append("")
             continue
 
         score = md.get("score", 0)
-        signal = md.get("signal", "?")
-        signal_action = md.get("signal_action", "")
-        boyut = md.get("signal_boyut", "%0")
-        conf = md.get("confidence", {})
-        conf_label = conf.get("label", "?") if isinstance(conf, dict) else "?"
+        signal = md.get("signal", "IZLE")
         phase = md.get("phase", None)
+        tech_note = md.get("tech_note", None)
+        conf = md.get("confidence", {})
+        if isinstance(conf, dict):
+            last_conf_label = conf.get("label", "?")
 
-        # Skor renk emojisi
-        if score >= 75:
-            score_emoji = "🟢"
-        elif score >= 65:
-            score_emoji = "🟡"
-        elif score >= 55:
-            score_emoji = "🟠"
-        elif score >= 40:
-            score_emoji = "🔴"
-        else:
-            score_emoji = "⛔"
+        # Karar bilgisi
+        karar = KARAR_MAP.get(signal, KARAR_MAP["IZLE"])
 
-        # Sinyal emojisi
-        signal_emojis = {
-            "NORMAL ALIM": "✅",
-            "KADEMELI ALIM": "🟢",
-            "DENEME ALIMI": "🟡",
-            "IZLE": "👀",
-            "UZAK DUR": "🚫",
-            "VERI EKSIK": "⚠️",
-        }
-        sig_emoji = signal_emojis.get(signal, "❓")
+        # Ana satır: Piyasa: Skor Karar
+        lines.append(f"{icon} {name}: {score} {karar['emoji']} {karar['label']}")
 
-        # Ana satir
-        line = f"{icon} <b>{name}:</b> {score_emoji} <b>{score}</b> — {sig_emoji} <b>{signal}</b> ({boyut})"
-        lines.append(line)
-
-        # Teknik faz (varsa)
+        # Teknik satır
         if phase and phase not in ("UNKNOWN",):
-            phase_labels = {
-                "GUCLU": "Teknik Güçlü 💪",
-                "TOPARLANIYOR": "Toparlanıyor 📈",
-                "ZAYIF": "Teknik Zayıf 📉",
-            }
-            phase_text = phase_labels.get(phase, phase)
-            lines.append(f"    <i>Faz: {phase_text}</i>")
+            phase_text = PHASE_MAP.get(phase, phase)
+            lines.append(f"Teknik: {phase_text}")
+        elif tech_note:
+            lines.append("Teknik: Skor Bazlı")
 
-        # Aksiyon cumlesi
-        if signal_action:
-            # Boyut bilgisini action'dan cikar (zaten ana satirda var)
-            action_clean = signal_action.split(" (Boyut:")[0]
-            lines.append(f"    <i>{escape_html(action_clean)}</i>")
-
+        # Not satır
+        lines.append(f"Not: {karar['not']}")
         lines.append("")
 
-    # Guven ve zaman
-    lines.append(f"<i>Güven: {conf_label} | {datetime.utcnow().strftime('%H:%M')} UTC</i>")
+    # Alt bilgi
+    saat = datetime.utcnow().strftime("%H:%M")
+    lines.append(f"Güven: {last_conf_label.capitalize()} | Saat: {saat} UTC")
 
     return "\n".join(lines)
 
@@ -887,9 +879,9 @@ def main():
     
     send_telegram_message(crypto_text)
 
-    # TCE skorları en son ayrı mesaj olarak
+    # TCE skorları en son ayrı mesaj olarak (plain text)
     if tce_text:
-        send_telegram_message(tce_text)
+        send_telegram_message(tce_text, parse_mode=None)
 
 
 if __name__ == "__main__":
