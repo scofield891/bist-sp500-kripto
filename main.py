@@ -707,20 +707,10 @@ def fetch_tce_scores() -> dict:
 
 def format_tce_message(data: dict) -> str:
     """
-    TCE skorlarını Telegram mesajı olarak formatlar.
-    Spec: kısa, tekrarsız, karar odaklı.
+    TCE v2 skorlarını Telegram mesajı olarak formatlar.
+    Rejim + Boyut + Stres + Flow + Teknik
     """
     lines = ["📊 TCE Piyasa Filtresi", ""]
-
-    # Karar → emoji + etiket + not mapping
-    KARAR_MAP = {
-        "UZAK DUR":      {"emoji": "⛔", "label": "Uzak Dur",              "not": "Yeni alım yok"},
-        "IZLE":          {"emoji": "👀", "label": "İzle",                  "not": "Şimdilik sadece izle"},
-        "DENEME ALIMI":  {"emoji": "🟡", "label": "Deneme Alımı (%25)",   "not": "Küçük boyut denenebilir"},
-        "KADEMELI ALIM": {"emoji": "🟠", "label": "Kademeli Alım (%50)",  "not": "Parça parça giriş uygun"},
-        "NORMAL ALIM":   {"emoji": "🟢", "label": "Normal Alım (%100)",   "not": "Normal boyutla alım uygun"},
-        "VERI EKSIK":    {"emoji": "⚠️", "label": "Veri Eksik",           "not": "Skor güvenilmez"},
-    }
 
     # Teknik faz → kısa etiket
     PHASE_MAP = {
@@ -744,28 +734,36 @@ def format_tce_message(data: dict) -> str:
             continue
 
         score = md.get("score", 0)
-        signal = md.get("signal", "IZLE")
-        phase = md.get("phase", None)
-        tech_note = md.get("tech_note", None)
         conf = md.get("confidence", {})
         if isinstance(conf, dict):
             last_conf_label = conf.get("label", "?")
 
-        # Karar bilgisi
-        karar = KARAR_MAP.get(signal, KARAR_MAP["IZLE"])
+        # v2: Rejim + Boyut
+        regime = md.get("regime", {})
+        action = md.get("action", {})
+        regime_name = regime.get("regime", "?")
+        size = action.get("size", "?")
 
-        # Ana satır: Piyasa: Skor Karar
-        lines.append(f"{icon} {name}: {score} {karar['emoji']} {karar['label']}")
+        # Ana satır: Piyasa: Skor | Rejim | Boyut
+        lines.append(f"{icon} {name}: {score} | {regime_name} | {size}")
+
+        # Stres + Flow satırı
+        stress = md.get("stress", {})
+        flow_q = md.get("flow_quality", {})
+        extra_parts = []
+        if stress.get("label") and stress["label"] not in ("UNKNOWN", "NORMAL"):
+            extra_parts.append(f"Stres: {stress['label']}")
+        if flow_q.get("label"):
+            extra_parts.append(flow_q["label"])
+        if extra_parts:
+            lines.append(" | ".join(extra_parts))
 
         # Teknik satır
+        phase = md.get("phase", None)
         if phase and phase not in ("UNKNOWN",):
             phase_text = PHASE_MAP.get(phase, phase)
             lines.append(f"Teknik: {phase_text}")
-        elif tech_note:
-            lines.append("Teknik: Skor Bazlı")
 
-        # Not satır
-        lines.append(f"Not: {karar['not']}")
         lines.append("")
 
     # Alt bilgi
