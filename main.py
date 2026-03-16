@@ -688,29 +688,64 @@ def scan_crypto_from_list() -> tuple:
 
 # =============== TCE Piyasa Filtresi ===============
 
-def fetch_tce_scores() -> dict:
+def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
     """
     TCE Super App API'den skor verisi çeker.
+    Retry: 3 deneme, arada 5 saniye bekle.
     Returns: API response dict veya None
     """
-    try:
-        r = requests.get(f"{TCE_API_URL}/api/scores", timeout=30)
-        if r.status_code == 200:
-            return r.json()
-        else:
-            print(f"TCE API hata: HTTP {r.status_code}")
-            return None
-    except Exception as e:
-        print(f"TCE API baglanti hatasi: {e}")
-        return None
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"TCE API deneme {attempt}/{retries}...")
+            r = requests.get(f"{TCE_API_URL}/api/scores/refresh", timeout=45)
+            if r.status_code == 200:
+                data = r.json()
+                if "error" in data:
+                    print(f"TCE API hata response: {data['error']}")
+                    if attempt < retries:
+                        time.sleep(delay)
+                        continue
+                    return None
+                return data
+            else:
+                print(f"TCE API hata: HTTP {r.status_code}")
+        except requests.exceptions.Timeout:
+            print(f"TCE API timeout (deneme {attempt})")
+        except Exception as e:
+            print(f"TCE API baglanti hatasi (deneme {attempt}): {e}")
+
+        if attempt < retries:
+            print(f"{delay}s bekleniyor...")
+            time.sleep(delay)
+
+    print("TCE API: Tum denemeler basarisiz.")
+    return None
 
 
 def format_tce_message(data: dict) -> str:
     """
-    TCE v2 skorlarını Telegram mesajı olarak formatlar.
-    Rejim + Boyut + Stres + Flow + Teknik
+    TCE v2.5 skorlarını Telegram mesajı olarak formatlar.
+    Format: Skor | Rejim | Boyut + Stres + Flow + Teknik
     """
-    lines = ["📊 TCE Piyasa Filtresi", ""]
+    lines = ["📊 TCE Piyasa Filtresi v2.5", ""]
+
+    # Rejim emoji mapping
+    REJIM_EMOJI = {
+        "KRIZ":              "⛔",
+        "ZAYIF PIYASA":      "⚠️",
+        "KARARSIZ":          "🔸",
+        "TOPARLANAN PIYASA": "📈",
+        "GUCLU PIYASA":      "🚀",
+        "UNKNOWN":           "❓",
+    }
+
+    # Stres emoji
+    STRES_EMOJI = {
+        "NORMAL":  "🟢",
+        "DIKKAT":  "🟡",
+        "YUKSEK":  "🟠",
+        "ASIRI":   "🔴",
+    }
 
     # Teknik faz → kısa etiket
     PHASE_MAP = {
@@ -725,8 +760,6 @@ def format_tce_message(data: dict) -> str:
         ("🇺🇸", "S&P 500", data.get("sp500", {})),
     ]
 
-    last_conf_label = "?"
-
     for icon, name, md in markets:
         if not md:
             lines.append(f"{icon} {name}: Veri yok")
@@ -734,41 +767,52 @@ def format_tce_message(data: dict) -> str:
             continue
 
         score = md.get("score", 0)
-        conf = md.get("confidence", {})
-        if isinstance(conf, dict):
-            last_conf_label = conf.get("label", "?")
-
-        # v2: Rejim + Boyut
-        regime = md.get("regime", {})
-        action = md.get("action", {})
-        regime_name = regime.get("regime", "?")
-        size = action.get("size", "?")
-
-        # Ana satır: Piyasa: Skor | Rejim | Boyut
-        lines.append(f"{icon} {name}: {score} | {regime_name} | {size}")
-
-        # Stres + Flow satırı
-        stress = md.get("stress", {})
-        flow_q = md.get("flow_quality", {})
-        extra_parts = []
-        if stress.get("label") and stress["label"] not in ("UNKNOWN", "NORMAL"):
-            extra_parts.append(f"Stres: {stress['label']}")
-        if flow_q.get("label"):
-            extra_parts.append(flow_q["label"])
-        if extra_parts:
-            lines.append(" | ".join(extra_parts))
-
-        # Teknik satır
+        regime_data = md.get("regime", {})
+        action_data = md.get("action", {})
+        stress_data = md.get("stress", {})
+        flow_data = md.get("flow_quality", {})
         phase = md.get("phase", None)
+
+        regime_name = regime_data.get("regime", "UNKNOWN")
+        regime_emoji = REJIM_EMOJI.get(regime_name, "❓")
+        boyut = action_data.get("size", "?")
+
+        # Ana satır: Piyasa | Skor | Rejim | Boyut
+        lines.append(f"{icon} {name}: {score} | {regime_emoji} {regime_name} | {boyut}")
+
+        # Detay satırı: Stres + Flow (varsa) + Teknik
+        details = []
+
+        # Stres
+        stres_label = stress_data.get("label", "")
+        if stres_label:
+            stres_e = STRES_EMOJI.get(stres_label, "")
+            details.append(f"Stres: {stres_e}{stres_label}")
+
+        # Flow Quality (sadece kripto)
+        if isinstance(flow_data, dict) and flow_data.get("label"):
+            details.append(f"Akış: {flow_data['label']}")
+
+        # Teknik faz
         if phase and phase not in ("UNKNOWN",):
             phase_text = PHASE_MAP.get(phase, phase)
-            lines.append(f"Teknik: {phase_text}")
+            details.append(f"Teknik: {phase_text}")
+
+        if details:
+            lines.append(" | ".join(details))
 
         lines.append("")
 
-    # Alt bilgi
+    # Confidence
+    conf = data.get("confidence", {})
+    conf_label = conf.get("label", "?") if isinstance(conf, dict) else "?"
+    locked = data.get("score_locked", False)
+
     saat = datetime.utcnow().strftime("%H:%M")
-    lines.append(f"Güven: {last_conf_label.capitalize()} | Saat: {saat} UTC")
+    footer = f"Güven: {conf_label.capitalize()} | Saat: {saat} UTC"
+    if locked:
+        footer += " | ⚠️ Skor Kilitli"
+    lines.append(footer)
 
     return "\n".join(lines)
 
@@ -856,7 +900,8 @@ def main():
         tce_text = format_tce_message(tce_data)
         print("TCE skorları alındı.")
     else:
-        print("TCE skorları alınamadı, mesaj gönderilmeyecek.")
+        tce_text = "📊 TCE Piyasa Filtresi\n\n⚠️ API'ye ulaşılamadı. Skorlar dashboard'dan kontrol edilebilir.\nhttp://144.24.164.111:8101"
+        print("TCE skorları alınamadı, uyarı mesajı gönderilecek.")
 
     # --- Telegram'a gönder --- #
     header = (
