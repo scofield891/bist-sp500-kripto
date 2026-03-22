@@ -691,13 +691,26 @@ def scan_crypto_from_list() -> tuple:
 def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
     """
     TCE Super App API'den skor verisi çeker.
+    Strateji: Önce cache'li endpoint (hızlı), yoksa refresh (yavaş).
     Retry: 3 deneme, arada 5 saniye bekle.
-    Returns: API response dict veya None
     """
+    # 1) Önce cache'li endpoint dene (hızlı)
+    try:
+        print("TCE API: cache'li skor deneniyor...")
+        r = requests.get(f"{TCE_API_URL}/api/scores", timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            if "error" not in data and data.get("crypto", {}).get("score", -1) >= 0:
+                print("TCE API: cache'li skor alindi.")
+                return data
+    except Exception as e:
+        print(f"TCE API cache hatasi: {e}")
+
+    # 2) Cache bossa/hataysa → refresh (tam hesaplama)
     for attempt in range(1, retries + 1):
         try:
-            print(f"TCE API deneme {attempt}/{retries}...")
-            r = requests.get(f"{TCE_API_URL}/api/scores/refresh", timeout=45)
+            print(f"TCE API refresh deneme {attempt}/{retries}...")
+            r = requests.get(f"{TCE_API_URL}/api/scores/refresh", timeout=90)
             if r.status_code == 200:
                 data = r.json()
                 if "error" in data:
@@ -749,9 +762,11 @@ def format_tce_message(data: dict) -> str:
 
     # Teknik faz → kısa etiket
     PHASE_MAP = {
-        "GUCLU": "Güçlü",
-        "TOPARLANIYOR": "Toparlanıyor",
-        "ZAYIF": "Zayıf",
+        "GUCLU_TREND": "Güçlü Trend",
+        "YORGUN_TREND": "Yorgun Trend",
+        "GECIS": "Geçiş",
+        "DIP_OLUSUMU": "Dip Oluşumu",
+        "RISKLI": "Riskli",
     }
 
     markets = [
