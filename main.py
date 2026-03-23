@@ -737,37 +737,10 @@ def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
 
 def format_tce_message(data: dict) -> str:
     """
-    TCE v2.5 skorlarını Telegram mesajı olarak formatlar.
-    Format: Skor | Rejim | Boyut + Stres + Flow + Teknik
+    TCE v3 skorlarını Telegram mesajı olarak formatlar.
+    Sade format: Skor | Rejim | Boyut. Detay dashboard'da.
     """
-    lines = ["📊 TCE Piyasa Filtresi v2.5", ""]
-
-    # Rejim emoji mapping
-    REJIM_EMOJI = {
-        "KRIZ":              "⛔",
-        "ZAYIF PIYASA":      "⚠️",
-        "KARARSIZ":          "🔸",
-        "TOPARLANAN PIYASA": "📈",
-        "GUCLU PIYASA":      "🚀",
-        "UNKNOWN":           "❓",
-    }
-
-    # Stres emoji
-    STRES_EMOJI = {
-        "NORMAL":  "🟢",
-        "DIKKAT":  "🟡",
-        "YUKSEK":  "🟠",
-        "ASIRI":   "🔴",
-    }
-
-    # Teknik faz → kısa etiket
-    PHASE_MAP = {
-        "GUCLU_TREND": "Güçlü Trend",
-        "YORGUN_TREND": "Yorgun Trend",
-        "GECIS": "Geçiş",
-        "DIP_OLUSUMU": "Dip Oluşumu",
-        "RISKLI": "Riskli",
-    }
+    lines = ["📊 TCE Piyasa Filtresi", ""]
 
     markets = [
         ("₿", "Kripto", data.get("crypto", {})),
@@ -778,56 +751,19 @@ def format_tce_message(data: dict) -> str:
     for icon, name, md in markets:
         if not md:
             lines.append(f"{icon} {name}: Veri yok")
-            lines.append("")
             continue
 
         score = md.get("score", 0)
-        regime_data = md.get("regime", {})
-        action_data = md.get("action", {})
-        stress_data = md.get("stress", {})
-        flow_data = md.get("flow_quality", {})
-        phase = md.get("phase", None)
+        regime_name = md.get("regime", {}).get("regime", "?")
+        boyut = md.get("action", {}).get("size", "?")
 
-        regime_name = regime_data.get("regime", "UNKNOWN")
-        regime_emoji = REJIM_EMOJI.get(regime_name, "❓")
-        boyut = action_data.get("size", "?")
+        lines.append(f"{icon} {name}: {score} | {regime_name} | {boyut}")
 
-        # Ana satır: Piyasa | Skor | Rejim | Boyut
-        lines.append(f"{icon} {name}: {score} | {regime_emoji} {regime_name} | {boyut}")
-
-        # Detay satırı: Stres + Flow (varsa) + Teknik
-        details = []
-
-        # Stres
-        stres_label = stress_data.get("label", "")
-        if stres_label:
-            stres_e = STRES_EMOJI.get(stres_label, "")
-            details.append(f"Stres: {stres_e}{stres_label}")
-
-        # Flow Quality (sadece kripto)
-        if isinstance(flow_data, dict) and flow_data.get("label"):
-            details.append(f"Akış: {flow_data['label']}")
-
-        # Teknik faz
-        if phase and phase not in ("UNKNOWN",):
-            phase_text = PHASE_MAP.get(phase, phase)
-            details.append(f"Teknik: {phase_text}")
-
-        if details:
-            lines.append(" | ".join(details))
-
-        lines.append("")
-
-    # Confidence
+    lines.append("")
     conf = data.get("confidence", {})
     conf_label = conf.get("label", "?") if isinstance(conf, dict) else "?"
-    locked = data.get("score_locked", False)
-
     saat = datetime.utcnow().strftime("%H:%M")
-    footer = f"Güven: {conf_label.capitalize()} | Saat: {saat} UTC"
-    if locked:
-        footer += " | ⚠️ Skor Kilitli"
-    lines.append(footer)
+    lines.append(f"Güven: {conf_label.capitalize()} | {saat} UTC")
 
     return "\n".join(lines)
 
