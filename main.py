@@ -697,7 +697,7 @@ def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
     # 1) Önce cache'li endpoint dene (hızlı)
     try:
         print("TCE API: cache'li skor deneniyor...")
-        r = requests.get(f"{TCE_API_URL}/api/scores", timeout=30)
+        r = requests.get(f"{TCE_API_URL}/api/scores", timeout=60)
         if r.status_code == 200:
             data = r.json()
             if "error" not in data and data.get("crypto", {}).get("score", -1) >= 0:
@@ -706,11 +706,11 @@ def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
     except Exception as e:
         print(f"TCE API cache hatasi: {e}")
 
-    # 2) Cache bossa/hataysa → refresh (tam hesaplama)
+    # 2) Cache bossa/hataysa → refresh (tam hesaplama, POST endpoint)
     for attempt in range(1, retries + 1):
         try:
             print(f"TCE API refresh deneme {attempt}/{retries}...")
-            r = requests.get(f"{TCE_API_URL}/api/scores/refresh", timeout=90)
+            r = requests.post(f"{TCE_API_URL}/api/scores/refresh", timeout=120)
             if r.status_code == 200:
                 data = r.json()
                 if "error" in data:
