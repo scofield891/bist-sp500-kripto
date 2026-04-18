@@ -52,9 +52,6 @@ COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 # Telegram mesaj karakter limiti (güvenli sınır)
 TELEGRAM_CHAR_LIMIT = 3800
 
-# ---- TCE Super App API ----
-TCE_API_URL = os.getenv("TCE_API_URL", "http://144.24.164.111:8100")
-
 # =============== Blacklist (Stablecoin + Fan Token) ===============
 
 CRYPTO_BLACKLIST = {
@@ -118,9 +115,8 @@ def send_telegram_message(text: str, parse_mode: str = "HTML"):
         payload = {
             "chat_id": CHAT_ID,
             "text": chunk,
+            "parse_mode": parse_mode
         }
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
         try:
             r = requests.post(url, json=payload, timeout=20)
             if not r.ok:
@@ -244,12 +240,13 @@ def has_recent_bullish_cross(
     max_bars_ago: int = 2,
     max_days_ago: int = 5,
     min_rel_gap: float = 0.001
-) -> bool:
+) -> int:
     """
     EMA bullish cross kontrolü.
+    Returns: cross kaç bar önce olduysa o sayı (0=bugün, 1=dün, ...), cross yoksa -1
     """
     if len(close) < slow + 3:
-        return False
+        return -1
 
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
@@ -262,7 +259,7 @@ def has_recent_bullish_cross(
             cross_indices.append(i)
 
     if not cross_indices:
-        return False
+        return -1
 
     last_cross = cross_indices[-1]
     last_idx = len(close) - 1
@@ -270,20 +267,19 @@ def has_recent_bullish_cross(
     # 1) Bar bazlı kontrol
     bars_ago = last_idx - last_cross
     if bars_ago > max_bars_ago:
-        return False
+        return -1
 
-    # 2) Gap kontrolü — son bardaki gap'e bakıyoruz (cross barında gap çok küçük olabilir)
+    # 2) Gap kontrolü — son bardaki gap'e bakıyoruz
     if min_rel_gap > 0:
         try:
             gap = float(ema_fast.iloc[-1] - ema_slow.iloc[-1])
             price = float(close.iloc[-1])
             if price <= 0 or gap <= 0:
-                return False
-            rel_gap = gap / price
-            if rel_gap < min_rel_gap:
-                return False
+                return -1
+            if gap / price < min_rel_gap:
+                return -1
         except Exception:
-            return False
+            return -1
 
     # 3) Sanity check: Fiyat EMA'dan çok uzaksa veri adjust sorunu var, skip et
     try:
@@ -292,7 +288,7 @@ def has_recent_bullish_cross(
         if price > 0 and ema_f > 0:
             price_vs_ema = abs(price - ema_f) / ema_f
             if price_vs_ema > 0.15:
-                return False
+                return -1
     except Exception:
         pass
 
@@ -318,11 +314,11 @@ def has_recent_bullish_cross(
             days_diff = (today_utc - cross_day).days
 
             if days_diff > max_days_ago:
-                return False
+                return -1
         except Exception:
             pass
 
-    return True
+    return bars_ago
 
 
 def summarize_errors(errors, max_show: int = 10) -> str:
@@ -365,13 +361,17 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
         min_gap = EMA_MIN_REL_GAP
     
     result = {
-        "13_34_bull": [],
+        "13_34_new": [],
+        "13_34_old": [],
         "errors": []
     }
 
     if not symbols:
         return result
 
+    # FIX: Tek sembol olsa bile yfinance'den MultiIndex almak için
+    # 2+ sembol gönderiyoruz. Tek sembol flat columns döndürür,
+    # bu durumda yanlış veriye bakılır.
     download_symbols = symbols if len(symbols) > 1 else symbols * 2
 
     try:
@@ -399,6 +399,8 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
                     continue
                 df_sym = data[sym].dropna()
             else:
+                # Bu noktaya artık ulaşılmamalı (yukarıdaki trick sayesinde)
+                # Güvenlik için bırakıldı
                 df_sym = data
 
             if "Close" not in df_sym.columns:
@@ -410,14 +412,19 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
                 result["errors"].append(sym)
                 continue
 
+            # FIX: Bugünün tamamlanmamış mumunu kaldır
             close = remove_incomplete_candle_equity(close)
 
             if close.empty or len(close) < 40:
                 result["errors"].append(sym)
                 continue
 
-            if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, min_gap):
-                result["13_34_bull"].append(sym)
+            bars_ago = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, min_gap)
+            if bars_ago >= 0:
+                if bars_ago == 0:
+                    result["13_34_new"].append(sym)
+                else:
+                    result["13_34_old"].append(sym)
 
         except Exception as e:
             print(f"{universe_name} veri hatası {sym}: {e}")
@@ -432,10 +439,12 @@ def get_coingecko_market_data() -> dict:
     """
     CoinGecko'dan top coinlerin market verisini çeker.
     Tek çağrıda 250 coin, 2 çağrıda 500 coin.
+    
+    Returns: {symbol: {volume_24h, market_cap, price}, ...}
     """
     market_data = {}
     
-    for page in [1, 2]:
+    for page in [1, 2]:  # İlk 500 coin
         try:
             url = f"{COINGECKO_API_URL}/coins/markets"
             params = {
@@ -453,6 +462,8 @@ def get_coingecko_market_data() -> dict:
                 for coin in data:
                     symbol = coin.get("symbol", "").upper()
                     if symbol:
+                        # FIX: Aynı sembol varsa market cap büyük olanı tut
+                        # (BNX, HOT gibi çakışan semboller için)
                         new_mcap = coin.get("market_cap", 0) or 0
                         if symbol in market_data:
                             existing_mcap = market_data[symbol]["market_cap"]
@@ -469,6 +480,7 @@ def get_coingecko_market_data() -> dict:
             else:
                 print(f"CoinGecko hata (sayfa {page}): HTTP {r.status_code}")
             
+            # Rate limit için bekle
             if page < 2:
                 time.sleep(1.5)
                 
@@ -482,7 +494,10 @@ def get_coingecko_market_data() -> dict:
 def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     """
     CoinGecko hacim verisiyle kripto filtreleme.
+    
+    Returns: (filtered_list, used_level, stats)
     """
+    # 1. Blacklist filtresi
     after_blacklist = []
     for sym in symbols:
         base = extract_base_symbol(sym)
@@ -494,6 +509,7 @@ def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     if not after_blacklist:
         return [], 0, {}
     
+    # 2. CoinGecko verisiyle eşleştir
     matched = []
     not_found = []
     
@@ -516,11 +532,16 @@ def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     if not matched:
         return [], 0, {"matched": 0, "not_found": len(not_found)}
     
+    # 3. Hacme göre sırala
     matched.sort(key=lambda x: x["volume_24h"], reverse=True)
     
+    # 4. Gevşetme seviyeleri ile filtrele
     relaxation_levels = [
+        # Level 0: Sıkı
         {"min_volume": 5000000, "min_mcap": 50000000, "label": "Sıkı"},
+        # Level 1: Normal
         {"min_volume": 2000000, "min_mcap": 20000000, "label": "Normal"},
+        # Level 2: Gevşek
         {"min_volume": 1000000, "min_mcap": 10000000, "label": "Gevşek"},
     ]
     
@@ -549,6 +570,7 @@ def filter_crypto_by_coingecko(symbols: list, market_data: dict) -> tuple:
     level_label = relaxation_levels[used_level]["label"]
     print(f"Kripto filtre: Level {used_level} ({level_label}), geçen: {len(final_list)} sembol")
     
+    # Maximum coin sayısına kırp (en hacimli olanlar zaten başta)
     if len(final_list) > CRYPTO_MAX_COINS:
         print(f"Max {CRYPTO_MAX_COINS} coin'e kırpılıyor ({len(final_list)} -> {CRYPTO_MAX_COINS})")
         final_list = final_list[:CRYPTO_MAX_COINS]
@@ -569,36 +591,60 @@ CRYPTO_OHLC_LIMIT = 220
 
 
 def find_mexc_symbol(base_symbol: str, markets: dict):
+    """
+    Base sembolü MEXC market adına çevirir.
+    """
     base = extract_base_symbol(base_symbol).upper()
     if not base:
         return None
-    candidates = [f"{base}/USDT", f"{base}/USDT:USDT"]
+
+    candidates = [
+        f"{base}/USDT",
+        f"{base}/USDT:USDT",
+    ]
+
     for c in candidates:
         if c in markets:
             return c
+
     return None
 
 
 def remove_incomplete_candle(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bugünkü tamamlanmamış mumu kaldırır.
+    """
     if df.empty:
         return df
+    
     last_ts = df["timestamp"].iloc[-1]
     last_date = pd.Timestamp(int(last_ts), unit="ms", tz="UTC").normalize()
     today = pd.Timestamp.now(tz="UTC").normalize()
+    
     if last_date >= today:
         return df.iloc[:-1]
+    
     return df
 
 
 def scan_crypto_from_list() -> tuple:
     """
-    Kripto tarama: midas.txt -> CoinGecko filtre -> MEXC mum -> EMA 13-34
+    Kripto tarama:
+    1. midas.txt'den sembolleri oku
+    2. CoinGecko'dan hacim verisi çek
+    3. Hacim filtresi uygula
+    4. MEXC'ten mum verisi çek
+    5. EMA 13-34 tara
+    
+    Returns: (result_dict, filter_level, scanned_count)
     """
     result = {
-        "13_34_bull": [],
+        "13_34_new": [],
+        "13_34_old": [],
         "errors": []
     }
 
+    # 1. Sembol listesini oku
     symbols = read_symbol_file(CRYPTO_LIST_FILE)
     if not symbols:
         print(f"{CRYPTO_LIST_FILE} boş veya bulunamadı.")
@@ -609,6 +655,7 @@ def scan_crypto_from_list() -> tuple:
     print(f"{'='*50}")
     print(f"Toplam sembol: {len(symbols)}")
     
+    # 2. CoinGecko'dan hacim verisi çek
     print("\nCoinGecko'dan hacim verisi çekiliyor...")
     market_data = get_coingecko_market_data()
     
@@ -616,6 +663,7 @@ def scan_crypto_from_list() -> tuple:
         print("CoinGecko verisi alınamadı!")
         return result, 0, 0
     
+    # 3. Hacim filtresi uygula
     filtered_symbols, filter_level, stats = filter_crypto_by_coingecko(symbols, market_data)
     
     if not filtered_symbols:
@@ -624,8 +672,11 @@ def scan_crypto_from_list() -> tuple:
     
     print(f"\nMEXC'ten mum verisi çekiliyor ({len(filtered_symbols)} sembol)...")
 
+    # 4. MEXC bağlantısı
     try:
-        exchange = ccxt.mexc({"enableRateLimit": True})
+        exchange = ccxt.mexc({
+            "enableRateLimit": True,
+        })
         markets = exchange.load_markets()
     except Exception as e:
         msg = f"MEXC borsası başlatılamadı: {e}"
@@ -633,6 +684,7 @@ def scan_crypto_from_list() -> tuple:
         result["errors"].append(msg)
         return result, filter_level, 0
 
+    # 5. Her coin için OHLCV çek ve EMA tara
     processed_count = 0
     mexc_not_found = 0
 
@@ -650,7 +702,11 @@ def scan_crypto_from_list() -> tuple:
             continue
 
         try:
-            ohlcv = exchange.fetch_ohlcv(mexc_symbol, timeframe=CRYPTO_TIMEFRAME, limit=CRYPTO_OHLC_LIMIT)
+            ohlcv = exchange.fetch_ohlcv(
+                mexc_symbol,
+                timeframe=CRYPTO_TIMEFRAME,
+                limit=CRYPTO_OHLC_LIMIT,
+            )
         except Exception as e:
             print(f"MEXC veri hatası {base}: {e}")
             result["errors"].append(base)
@@ -660,7 +716,11 @@ def scan_crypto_from_list() -> tuple:
             result["errors"].append(base)
             continue
 
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(
+            ohlcv,
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
+        
         df = remove_incomplete_candle(df)
         
         if len(df) < 60:
@@ -670,8 +730,12 @@ def scan_crypto_from_list() -> tuple:
         df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         close = pd.Series(df["close"].astype(float).values, index=df["dt"])
 
-        if has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP):
-            result["13_34_bull"].append(base)
+        bars_ago = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP)
+        if bars_ago >= 0:
+            if bars_ago == 0:
+                result["13_34_new"].append(base)
+            else:
+                result["13_34_old"].append(base)
 
         processed_count += 1
 
@@ -681,91 +745,10 @@ def scan_crypto_from_list() -> tuple:
     print(f"Filtre sonrası: {len(filtered_symbols)} sembol")
     print(f"MEXC'te bulunamayan: {mexc_not_found}")
     print(f"Başarıyla işlenen: {processed_count}")
-    print(f"EMA 13-34 kesişimi: {len(result['13_34_bull'])} adet")
+    print(f"EMA 13-34 kesişimi: {len(result['13_34_new']) + len(result['13_34_old'])} adet "
+          f"(yeni: {len(result['13_34_new'])}, eski: {len(result['13_34_old'])})")
 
     return result, filter_level, processed_count
-
-
-# =============== TCE Piyasa Filtresi ===============
-
-def fetch_tce_scores(retries: int = 3, delay: int = 5) -> dict:
-    """
-    TCE Super App API'den skor verisi çeker.
-    Strateji: Önce cache'li endpoint (hızlı), yoksa refresh (yavaş).
-    Retry: 3 deneme, arada 5 saniye bekle.
-    """
-    # 1) Önce cache'li endpoint dene (hızlı)
-    try:
-        print("TCE API: cache'li skor deneniyor...")
-        r = requests.get(f"{TCE_API_URL}/api/scores", timeout=60)
-        if r.status_code == 200:
-            data = r.json()
-            if "error" not in data and data.get("crypto", {}).get("score", -1) >= 0:
-                print("TCE API: cache'li skor alindi.")
-                return data
-    except Exception as e:
-        print(f"TCE API cache hatasi: {e}")
-
-    # 2) Cache bossa/hataysa → refresh (tam hesaplama, POST endpoint)
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"TCE API refresh deneme {attempt}/{retries}...")
-            r = requests.post(f"{TCE_API_URL}/api/scores/refresh", timeout=120)
-            if r.status_code == 200:
-                data = r.json()
-                if "error" in data:
-                    print(f"TCE API hata response: {data['error']}")
-                    if attempt < retries:
-                        time.sleep(delay)
-                        continue
-                    return None
-                return data
-            else:
-                print(f"TCE API hata: HTTP {r.status_code}")
-        except requests.exceptions.Timeout:
-            print(f"TCE API timeout (deneme {attempt})")
-        except Exception as e:
-            print(f"TCE API baglanti hatasi (deneme {attempt}): {e}")
-
-        if attempt < retries:
-            print(f"{delay}s bekleniyor...")
-            time.sleep(delay)
-
-    print("TCE API: Tum denemeler basarisiz.")
-    return None
-
-
-def format_tce_message(data: dict) -> str:
-    """
-    TCE v3 skorlarını Telegram mesajı olarak formatlar.
-    Sade format: Skor | Rejim | Boyut. Detay dashboard'da.
-    """
-    lines = ["📊 TCE Piyasa Filtresi", ""]
-
-    markets = [
-        ("₿", "Kripto", data.get("crypto", {})),
-        ("🇹🇷", "BIST", data.get("bist", {})),
-        ("🇺🇸", "S&P 500", data.get("sp500", {})),
-    ]
-
-    for icon, name, md in markets:
-        if not md:
-            lines.append(f"{icon} {name}: Veri yok")
-            continue
-
-        score = md.get("score", 0)
-        regime_name = md.get("regime", {}).get("regime", "?")
-        boyut = md.get("action", {}).get("size", "?")
-
-        lines.append(f"{icon} {name}: {score} | {regime_name} | {boyut}")
-
-    lines.append("")
-    conf = data.get("confidence", {})
-    conf_label = conf.get("label", "?") if isinstance(conf, dict) else "?"
-    saat = datetime.utcnow().strftime("%H:%M")
-    lines.append(f"Güven: {conf_label.capitalize()} | {saat} UTC")
-
-    return "\n".join(lines)
 
 
 # =============== Formatlama (HTML) ===============
@@ -773,6 +756,7 @@ def format_tce_message(data: dict) -> str:
 def format_result_block(title: str, res: dict) -> str:
     """
     Sonuçları HTML formatında formatlar.
+    Yeni kesişim (bugün) ve eski kesişim (1-2 bar önce) ayrı gösterilir.
     """
     lines = [f"<b>📌 {escape_html(title)}</b>"]
 
@@ -785,10 +769,22 @@ def format_result_block(title: str, res: dict) -> str:
         coins_str = "\n".join(result_lines)
         return f"<code>{escape_html(coins_str)}</code>"
 
-    bull_list = res.get('13_34_bull', [])
-    count_str = f" ({len(bull_list)} adet)" if bull_list else ""
+    new_list = res.get('13_34_new', [])
+    old_list = res.get('13_34_old', [])
+    total = len(new_list) + len(old_list)
+    
+    count_str = f" ({total} adet)" if total > 0 else ""
     lines.append(f"<b>EMA13-34 KESİŞİMİ{count_str}:</b>")
-    lines.append(format_coin_list(bull_list))
+    
+    if total == 0:
+        lines.append("<i>-</i>")
+    else:
+        if new_list:
+            lines.append(f"🆕 <b>Yeni ({len(new_list)}):</b>")
+            lines.append(format_coin_list(new_list))
+        if old_list:
+            lines.append(f"📋 <b>Devam ({len(old_list)}):</b>")
+            lines.append(format_coin_list(old_list))
 
     err_line = summarize_errors(res.get("errors", []))
     if err_line:
@@ -798,6 +794,7 @@ def format_result_block(title: str, res: dict) -> str:
 
 
 def get_filter_level_label(level: int) -> str:
+    """Filtre seviyesinin Türkçe etiketini döndürür."""
     labels = {
         0: "Sıkı 🔒",
         1: "Normal ✅",
@@ -843,17 +840,6 @@ def main():
     filter_label = get_filter_level_label(crypto_filter_level)
     crypto_text = format_result_block(f"🪙 Kripto ({crypto_scanned} coin tarandı)", crypto_res)
 
-    # --- TCE Piyasa Filtresi --- #
-    print("\nTCE skorları çekiliyor...")
-    tce_data = fetch_tce_scores()
-    tce_text = None
-    if tce_data:
-        tce_text = format_tce_message(tce_data)
-        print("TCE skorları alındı.")
-    else:
-        tce_text = "📊 TCE Piyasa Filtresi\n\n⚠️ API'ye ulaşılamadı. Skorlar dashboard'dan kontrol edilebilir.\nhttp://144.24.164.111:8101"
-        print("TCE skorları alınamadı, uyarı mesajı gönderilecek.")
-
     # --- Telegram'a gönder --- #
     header = (
         f"<b>📊 EMA 13-34 Yükseliş Kesişim Tarama</b>\n"
@@ -872,10 +858,6 @@ def main():
         send_telegram_message(nasdaq_text)
     
     send_telegram_message(crypto_text)
-
-    # TCE skorları en son ayrı mesaj olarak (plain text)
-    if tce_text:
-        send_telegram_message(tce_text, parse_mode=None)
 
 
 if __name__ == "__main__":
