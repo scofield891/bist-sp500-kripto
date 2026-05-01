@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime
 import requests
 import time
@@ -45,6 +46,7 @@ BIST_EMA_MIN_REL_GAP = float(os.getenv("BIST_EMA_MIN_REL_GAP", "0.0005"))  # %0.
 # BIST/NASDAQ için pencere ayarları
 EQUITY_MAX_BARS_AGO = int(os.getenv("EQUITY_MAX_BARS_AGO", "2"))  # Son 2 bar
 EQUITY_MAX_DAYS_AGO = int(os.getenv("EQUITY_MAX_DAYS_AGO", "5"))  # Hafta sonu kaçırmasın
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))  # Yeni/Devam karşılaştırma: son 3 gün
 
 # CoinGecko API
 COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
@@ -321,6 +323,84 @@ def has_recent_bullish_cross(
     return bars_ago
 
 
+# =============== Geçmiş Karşılaştırma (Yeni/Devam) ===============
+
+HISTORY_FILE = os.getenv("HISTORY_FILE", "scan_history.json")
+
+
+def load_scan_history() -> dict:
+    """scan_history.json'dan geçmiş tarama sonuçlarını okur."""
+    if not os.path.exists(HISTORY_FILE):
+        return {}
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Geçmiş dosyası okuma hatası: {e}")
+        return {}
+
+
+def save_scan_history(history: dict):
+    """Tarama sonuçlarını scan_history.json'a kaydeder. 7 günden eski kayıtları siler."""
+    # Eski kayıtları temizle (7 günden eski)
+    today = datetime.utcnow().date()
+    clean_history = {}
+    for date_str, data in history.items():
+        try:
+            entry_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if (today - entry_date).days <= 7:
+                clean_history[date_str] = data
+        except Exception:
+            continue
+
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(clean_history, f, ensure_ascii=False, indent=2)
+        print(f"Tarama geçmişi kaydedildi: {HISTORY_FILE}")
+    except Exception as e:
+        print(f"Geçmiş dosyası yazma hatası: {e}")
+
+
+def get_past_symbols(history: dict, market: str, lookback_days: int = 3) -> set:
+    """
+    Son N günün tarama sonuçlarından sembol setini oluşturur.
+    Bugünü dahil etmez, sadece geçmiş günlere bakar.
+    """
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    past_symbols = set()
+
+    for date_str, data in history.items():
+        if date_str == today_str:
+            continue
+        try:
+            entry_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+            if (today_date - entry_date).days <= lookback_days:
+                symbols = data.get(market, [])
+                past_symbols.update(symbols)
+        except Exception:
+            continue
+
+    return past_symbols
+
+
+def classify_signals(today_symbols: list, past_symbols: set) -> tuple:
+    """
+    Bugünkü sonuçları geçmişle karşılaştırır.
+    Returns: (new_list, continue_list)
+    """
+    new_list = []
+    continue_list = []
+
+    for sym in today_symbols:
+        if sym in past_symbols:
+            continue_list.append(sym)
+        else:
+            new_list.append(sym)
+
+    return new_list, continue_list
+
+
 def summarize_errors(errors, max_show: int = 10) -> str:
     if not errors:
         return ""
@@ -361,8 +441,7 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
         min_gap = EMA_MIN_REL_GAP
     
     result = {
-        "13_34_new": [],
-        "13_34_old": [],
+        "13_34_bull": [],
         "errors": []
     }
 
@@ -419,12 +498,9 @@ def scan_equity_universe(symbols, universe_name: str, min_gap: float = None):
                 result["errors"].append(sym)
                 continue
 
-            bars_ago = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, min_gap)
-            if bars_ago >= 0:
-                if bars_ago == 0:
-                    result["13_34_new"].append(sym)
-                else:
-                    result["13_34_old"].append(sym)
+            cross_result = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, min_gap)
+            if cross_result >= 0:
+                result["13_34_bull"].append(sym)
 
         except Exception as e:
             print(f"{universe_name} veri hatası {sym}: {e}")
@@ -639,8 +715,7 @@ def scan_crypto_from_list() -> tuple:
     Returns: (result_dict, filter_level, scanned_count)
     """
     result = {
-        "13_34_new": [],
-        "13_34_old": [],
+        "13_34_bull": [],
         "errors": []
     }
 
@@ -730,12 +805,9 @@ def scan_crypto_from_list() -> tuple:
         df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         close = pd.Series(df["close"].astype(float).values, index=df["dt"])
 
-        bars_ago = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP)
-        if bars_ago >= 0:
-            if bars_ago == 0:
-                result["13_34_new"].append(base)
-            else:
-                result["13_34_old"].append(base)
+        cross_result = has_recent_bullish_cross(close, 13, 34, EQUITY_MAX_BARS_AGO, EQUITY_MAX_DAYS_AGO, EMA_MIN_REL_GAP)
+        if cross_result >= 0:
+            result["13_34_bull"].append(base)
 
         processed_count += 1
 
@@ -745,8 +817,7 @@ def scan_crypto_from_list() -> tuple:
     print(f"Filtre sonrası: {len(filtered_symbols)} sembol")
     print(f"MEXC'te bulunamayan: {mexc_not_found}")
     print(f"Başarıyla işlenen: {processed_count}")
-    print(f"EMA 13-34 kesişimi: {len(result['13_34_new']) + len(result['13_34_old'])} adet "
-          f"(yeni: {len(result['13_34_new'])}, eski: {len(result['13_34_old'])})")
+    print(f"EMA 13-34 kesişimi: {len(result['13_34_bull'])} adet")
 
     return result, filter_level, processed_count
 
@@ -756,7 +827,7 @@ def scan_crypto_from_list() -> tuple:
 def format_result_block(title: str, res: dict) -> str:
     """
     Sonuçları HTML formatında formatlar.
-    Yeni kesişim (bugün) ve eski kesişim (1-2 bar önce) ayrı gösterilir.
+    Yeni kesişim (bugün) ve devam eden kesişim (1-3 bar önce) ayrı gösterilir.
     """
     lines = [f"<b>📌 {escape_html(title)}</b>"]
 
@@ -808,6 +879,10 @@ def get_filter_level_label(level: int) -> str:
 def main():
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
 
+    # --- Geçmiş tarama sonuçlarını yükle --- #
+    history = load_scan_history()
+    today_history = {}  # Bugünkü sonuçlar buraya kaydedilecek
+
     # --- BIST (havuzdan likiditeye göre TOP N) --- #
     bist_all = read_symbol_file(BIST_ALL_FILE)
     bist_text = None
@@ -822,6 +897,15 @@ def main():
 
         if bist_symbols:
             bist_res = scan_equity_universe(bist_symbols, "BIST Likit", min_gap=BIST_EMA_MIN_REL_GAP)
+            bist_bulls = bist_res.get("13_34_bull", [])
+            today_history["bist"] = bist_bulls
+
+            # Geçmişle karşılaştır (BIST: iş günü, 3 gün yeterli)
+            past_bist = get_past_symbols(history, "bist", LOOKBACK_DAYS)
+            new_list, cont_list = classify_signals(bist_bulls, past_bist)
+            bist_res["13_34_new"] = new_list
+            bist_res["13_34_old"] = cont_list
+
             bist_label_full = f"🇹🇷 {BIST_LABEL} ({len(bist_symbols)} hisse)"
             bist_text = format_result_block(bist_label_full, bist_res)
     else:
@@ -833,12 +917,34 @@ def main():
     
     if nasdaq_symbols:
         nasdaq_res = scan_equity_universe(nasdaq_symbols, "NASDAQ 100", min_gap=EMA_MIN_REL_GAP)
+        nasdaq_bulls = nasdaq_res.get("13_34_bull", [])
+        today_history["nasdaq"] = nasdaq_bulls
+
+        # Geçmişle karşılaştır
+        past_nasdaq = get_past_symbols(history, "nasdaq", LOOKBACK_DAYS)
+        new_list, cont_list = classify_signals(nasdaq_bulls, past_nasdaq)
+        nasdaq_res["13_34_new"] = new_list
+        nasdaq_res["13_34_old"] = cont_list
+
         nasdaq_text = format_result_block("🇺🇸 NASDAQ 100", nasdaq_res)
 
     # --- Kripto (CoinGecko hacim + MEXC mum) --- #
     crypto_res, crypto_filter_level, crypto_scanned = scan_crypto_from_list()
+    crypto_bulls = crypto_res.get("13_34_bull", [])
+    today_history["crypto"] = crypto_bulls
+
+    # Geçmişle karşılaştır
+    past_crypto = get_past_symbols(history, "crypto", LOOKBACK_DAYS)
+    new_list, cont_list = classify_signals(crypto_bulls, past_crypto)
+    crypto_res["13_34_new"] = new_list
+    crypto_res["13_34_old"] = cont_list
+
     filter_label = get_filter_level_label(crypto_filter_level)
     crypto_text = format_result_block(f"🪙 Kripto ({crypto_scanned} coin tarandı)", crypto_res)
+
+    # --- Bugünkü sonuçları geçmişe kaydet --- #
+    history[today_str] = today_history
+    save_scan_history(history)
 
     # --- Telegram'a gönder --- #
     header = (
@@ -847,7 +953,7 @@ def main():
         f"<b>Timeframe:</b> 1D\n"
         f"<b>Evren:</b> {BIST_LABEL}, NASDAQ 100, Midas Kripto\n"
         f"<b>Kripto Filtre:</b> {filter_label} (Level {crypto_filter_level})\n"
-        f"<i>NOT: Sadece son 1-2 mumda oluşmuş bullish kesişimler.</i>"
+        f"<i>NOT: 🆕=Yeni kesişim, 📋=Son {LOOKBACK_DAYS} günde de vardı</i>"
     )
     send_telegram_message(header)
 
