@@ -953,7 +953,7 @@ def main():
         f"<b>Timeframe:</b> 1D\n"
         f"<b>Evren:</b> {BIST_LABEL}, NASDAQ 100, Midas Kripto\n"
         f"<b>Kripto Filtre:</b> {filter_label} (Level {crypto_filter_level})\n"
-        f"<i>NOT: 🆕=Yeni kesişim, 📋=Son {LOOKBACK_DAYS} günde de vardı</i>"
+        f"<i>🆕 Yeni kesişim | 📋 Devam eden kesişim</i>"
     )
     send_telegram_message(header)
 
