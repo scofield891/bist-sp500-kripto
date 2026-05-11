@@ -1,8 +1,7 @@
 name: EMA Scan
 on:
-  schedule:
-    # Her gün 00:15 UTC -> Türkiye saatiyle 03:15
-    - cron: "15 0 * * *"
+  # schedule:
+  #   - cron: "15 0 * * *"
   workflow_dispatch:
 jobs:
   run:
